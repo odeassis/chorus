@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.16.4] - 2026-08-19
+
+### Added
+- **DeepSeek Harness (dsh) plugin**: Ships `@chorus-aidlc/chorus-dsh` as an installable npm bundle — Chorus's sixth plugin surface — with the full skill set, a Node `chorus-mcp-call` wrapper, a served credential-provisioning script, a dedicated onboarding tab, and `CONNECT_DSH` docs. (#499)
+- **Backend-session resume**: Daemon-spawned backends now persist a `backendSessionId` (new Prisma migration) so a turn can resume the underlying agent session across the daemon turn-advance path. (#499)
+- **Prompt for agent backend when adding a daemon agent**: `daemon login`, `--add`, and the install "Add another agent?" loop now ask which backend to use (Claude Code / Codex / Kiro), reusing the install backend menu. `--agent` still wins; choosing nothing omits the field so the agent inherits the daemon default instead of a hardcoded `claude-code`. (#501)
+
+### Fixed
+- **Approve/reject proposal without a cwd picker**: Approving or rejecting a proposal in the UI no longer pops the cwd picker. The assignee wake target resolves entirely server-side (follow pin → online idea-session origin → agent-owner project cwd); with no pin it wakes only when exactly one connection is online and suppresses to notify-only on two or more. (#500)
+
+### Plugin
+- **Plugin & skill versions → 0.16.4**: Claude Code, Codex, OpenClaw, Kiro, Pi, and dsh plugin/skill distributions plus the standalone skill all bumped to 0.16.4.
+
+---
+
+## [0.16.3] - 2026-08-17
+
+### Added
+- **Assign an idea to an agent or user (MCP)**: New `chorus_pm_assign_idea` tool (idea:admin) assigns an Idea to a specified agent or user, reusing the existing `idea_claimed` wake; the wake prompt now names the assigner and advances from the current stage. Ships alongside a new `chorus:orchestrate` multi-agent-collaboration skill across all six skill surfaces with entry-skill routing. (#494)
+- **DiceBear agent avatars**: Agents now render as deterministic, animated DiceBear (Voxel Bot) avatars via a single shared `<AgentAvatar>` component, swept across ~30 surfaces — collaboration/comments, idea & task assignees, real-time presence/connections, proposal creators, onboarding, cwd pins, API-key list, and daemon chat. Humans keep their initials/User icon; the presence graph canvas keeps its name-hashed color ring. (#497)
+
+### Changed
+- **Gateway resolve/skip of an assigned idea's elaboration**: A non-assignee holding `idea:admin` can now resolve or skip an assigned idea's elaboration; doing so emits `elaboration_verified` to wake the assignee agent to write the proposal — MCP parity with the UI Verify-Elaborate handoff. Assignee self-validate/skip is unchanged. (#495)
+
+### Fixed
+- **Concurrent daemon sessions duplicating work**: An autonomous idea-anchored wake still resolving to `online_first` after all pin steps now deterministically narrows to a single connection instead of broadcasting to every online connection of the agent, closing the Case-4 fan-out that produced duplicate elaboration rounds and near-duplicate comments. (#496)
+
+### Plugin
+- **Plugin & skill versions → 0.16.3**: Claude Code, Codex, OpenClaw, Kiro, and Pi plugin/skill distributions plus the standalone skill all bumped to 0.16.3.
+
+---
+
 ## [0.16.2] - 2026-08-16
 
 ### Added

@@ -880,6 +880,92 @@ export async function createTurnAndResolveTarget(
       }
     }
 
+    // (4a-bis) Proposal-review ambiguity suppression (idea 146a7a9b). Approving or rejecting a
+    // proposal in the UI must resolve the assignee wake WITHOUT ever popping a cwd picker (the
+    // client dialog is removed): honor a hard pin (step 3), an online idea session-origin (step
+    // 4), or the agent-owner project cwd pin (step 4a) — all of which already short-circuited to
+    // `directed` / `offline_pin` ABOVE and are NEVER overridden here — else wake ONLY when the
+    // online target is UNAMBIGUOUS. With NO such resolution (selection is STILL `online_first`)
+    // AND two-or-more online connections, there is no single determinable cwd, so SUPPRESS the
+    // wake as notify-only (the offline_pin-shaped result) rather than letting step 4b narrow to
+    // an arbitrary first-online connection — that arbitrary pick was the removed dialog's job and
+    // is exactly what the owner rejected at this review gate. With EXACTLY ONE online connection
+    // the target is unambiguous: fall through to step 4b, which promotes online_first → directed
+    // on that sole connection and wakes it.
+    //
+    // Discriminated on `ctx.action` (the RAW notification action) — NOT `trigger`, which
+    // collapses `proposal_approved` / `proposal_rejected` into `task_assigned`
+    // (NOTIFICATION_ACTION_TO_TURN_TRIGGER) — so ONLY the two proposal-review actions carve out
+    // of the narrow; every other residual trigger (task_assigned, elaboration, mentioned, …)
+    // still reaches step 4b and narrows as today. Gated ALSO on `selection.kind === "online_first"`
+    // so any hard pin, online session-origin, or project pin above (which produced `directed` /
+    // `offline_pin`) is preserved verbatim (elaboration Q5 precedence). No durable pin is
+    // persisted — the server never writes an idea pin; the removed client reassign was the only
+    // persist (elaboration Q4). The recipient (proposal.createdByUuid) is unchanged — out of scope.
+    const isProposalReviewAction =
+      ctx.action === "proposal_approved" || ctx.action === "proposal_rejected";
+    if (isProposalReviewAction && selection.kind === "online_first") {
+      const onlineCount = connections.filter(
+        (c) => c.effectiveStatus === "online",
+      ).length;
+      if (onlineCount >= 2) {
+        // Ambiguous: no pin / session-origin / project pin resolved a single cwd and the
+        // recipient agent is online in two-or-more cwds → notify-only. Same shape as an offline
+        // pin: NO turn, NO target, suppressWake TRUE so every connection suppresses its broadcast
+        // copy via cli/event-router.mjs. The already-created Notification stands as the plain
+        // record. No picker, no arbitrary online-first pick.
+        return {
+          turn: null,
+          targetConnectionUuid: null,
+          runtimeCwd: null,
+          suppressWake: true,
+        };
+      }
+      // Exactly one online → unambiguous. Deliberately fall through to step 4b, which promotes
+      // this online_first selection to `directed` on the sole connection and wakes it. No pin
+      // is persisted.
+    }
+
+    // (4b) Single-active-session narrow (idea 62920792 / daemon-single-active-session). When
+    // a residual-family wake (the RESIDUAL_CWD_UPGRADE_TRIGGERS set — the autonomous
+    // idea-anchored family task_assigned / elaboration / elaboration_verified /
+    // start_development / yolo_requested PLUS the un-pinned `mentioned` wake) is STILL
+    // `online_first` after steps 4 and 4a — no instance/mention cwd pin (step 3), no ONLINE
+    // idea session-origin (step 4), no agent-owner project cwd pin (step 4a) — it would emit
+    // `targetConnectionUuid: null, suppressWake: false` and the daemon would BROADCAST it to
+    // EVERY online connection of the agent (event-router Case 4). With the same agent online
+    // in multiple cwds/hosts, each connection then spawns its own headless session and each
+    // independently advances the same entity — the duplicate elaboration rounds / near-dup
+    // comments this idea fixes. Deterministically NARROW to the ONE online-first connection
+    // already chosen by `selectOriginConnection` and promote it to `directed`, so the wake is
+    // delivered to that single connection (the existing `deliver_turn` ping + `targetConnection-
+    // Uuid` stamp) and every OTHER connection suppresses its broadcast copy (Case 2).
+    //
+    // Convergence (the guarantee): `listConnectionsForAgent` orders connections via
+    // `sortConnectionViews`, which is online-first with a STABLE, timestamp-free identity
+    // tie-break — so "first online" is a pure function of the current online set. Two
+    // near-simultaneous wakes for the same (agent, idea) observe the same set and pick the
+    // SAME connection; its per-connection WakeQueue then coalesces them into one run
+    // (daemon-wake-coalescing), and once that connection builds the idea's DaemonSession
+    // origin, step 4 pins subsequent wakes there. Bootstrap + self-sustaining, keyed on
+    // (agent, idea) via the idea-anchored sessionId.
+    //
+    // Precedence & scope: this fires ONLY on `online_first`, i.e. after steps 3/4/4a all
+    // declined — a cwd pin, an online idea origin, or a project pin all short-circuit it
+    // (they yield `directed` / `offline_pin`), so the owner's cwd-pin → project-pin → narrow
+    // order holds exactly. Human-directed / pinned wakes never reach `online_first`
+    // (`directed` / `offline_pin` in step 3); `human_instruction` is excluded from the
+    // residual set and owns its own send path. `offline_pin` / `none` never have kind
+    // `online_first`, so they are untouched (offline degrade unchanged). A single online
+    // connection narrows to itself (behaviorally identical to the prior broadcast-to-one, now
+    // with an explicit target). No I/O — a pure in-memory selection promotion.
+    if (
+      RESIDUAL_CWD_UPGRADE_TRIGGERS.has(trigger) &&
+      selection.kind === "online_first"
+    ) {
+      selection = { kind: "directed", connection: selection.connection };
+    }
+
     // offline_pin / none → NOTHING to wake. NO turn, NO ping, NO target. The already-
     // created Notification stands as the plain record. offline_pin specifically does NOT
     // fall back to online-first (the user-visible defect being fixed).
