@@ -45,7 +45,7 @@
     --card-foreground: 0 0% 17%; /* #2C2C2C */
     --popover: 0 0% 100%;
     --popover-foreground: 0 0% 17%;
-    --primary: 21 49% 55%; /* #C67A52 - Chorus Terracotta */
+    --primary: 224, 84%, 47%; /* #1348dc */
     --primary-foreground: 0 0% 100%; /* white */
     --secondary: 40 17% 95%; /* #F5F2EC */
     --secondary-foreground: 0 0% 17%;
@@ -57,8 +57,8 @@
     --destructive-foreground: 0 0% 100%;
     --border: 36 12% 89%; /* #E5E0D8 */
     --input: 36 12% 89%; /* #E5E0D8 */
-    --ring: 21 49% 55%; /* #C67A52 */
-    --radius: 0.5rem;
+    --ring: 224, 84%, 47%; /* #1348dc */
+    --radius: 0.2rem;
 
     /* Chart colors */
     --chart-1: 21 49% 55%;

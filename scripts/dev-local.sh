@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
+set -o pipefail
 
 export CHORUS_USE_PGLITE=1
 PGLITE_DIR="${PGLITE_DIR:-.pglite}"

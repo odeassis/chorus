@@ -1011,15 +1011,16 @@ export function registerPublicTools(server: McpServer, auth: AgentAuthContext) {
   server.registerTool(
     "chorus_search",
     collectionToolConfig({
-      description: "Search compact summaries across tasks, ideas, proposals, documents, projects, and project groups. A canonical UUID query performs tenant-scoped exact lookup first; text search is the fallback. Prefer this tool for discovery, use paginated list tools only for browsing, and call the entity's single-resource get tool for full details.",
+      description: "Search compact summaries across tasks, ideas, proposals, documents, projects, and project groups. A canonical UUID query performs tenant-scoped exact lookup first; text search is the fallback. Results are relevance-ranked: multi-word queries match on any term (more matched terms rank higher), and `score` is comparable within one response only. Prefer this tool for discovery, use paginated list tools only for browsing, and call the entity's single-resource get tool for full details.",
       inputSchema: z.object({
         query: z.string().describe("Canonical entity UUID for exact lookup, or text matching title, description, and content"),
         scope: z.enum(["global", "group", "project"]).optional().default("global").describe("Search scope"),
         scopeUuid: z.string().optional().describe("Project group UUID (scope=group) or project UUID (scope=project)"),
         entityTypes: zArray(z.enum(["task", "idea", "proposal", "document", "project", "project_group"])).optional().describe("Entity types to search (default: all). Example: [\"task\", \"idea\"]"),
+        explain: z.boolean().optional().default(false).describe("Include per-result ranking provenance (which streams matched, at what rank, and the authority adjustment). Diagnostic — leave off unless you are investigating why something ranked where it did."),
       }),
     }),
-    async ({ query, scope, scopeUuid, entityTypes }) => {
+    async ({ query, scope, scopeUuid, entityTypes, explain }) => {
       const result = await searchService.search({
         companyUuid: auth.companyUuid,
         query,
@@ -1027,14 +1028,16 @@ export function registerPublicTools(server: McpServer, auth: AgentAuthContext) {
         scopeUuid,
         entityTypes,
         limit: 50,
+        explain,
       });
       const rows = result.results.map((row) => ({
         ...compactCollectionRow(
           row,
-          ["entityType", "uuid", "title", "status", "projectUuid", "projectName", "updatedAt"],
+          ["entityType", "uuid", "title", "status", "projectUuid", "projectName", "updatedAt", "score"],
           ["title", "projectName"],
         ),
         snippet: truncatePreviewText(row.snippet),
+        ...(explain && row.explain ? { explain: row.explain } : {}),
       }));
       return {
         content: [{

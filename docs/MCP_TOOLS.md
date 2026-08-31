@@ -571,7 +571,7 @@ Each task in the response includes the full TaskResponse format (with dependsOn,
 
 ### chorus_search
 
-**Description**: Search compact summaries across tasks, ideas, proposals, documents, projects, and project groups. A canonical UUID query performs tenant-scoped exact lookup first; text search is the fallback. Prefer search for discovery, use paginated list tools only for browsing, and call the entity's single-resource `get` tool for full details.
+**Description**: Search compact summaries across tasks, ideas, proposals, documents, projects, and project groups. A canonical UUID query performs tenant-scoped exact lookup first; text search is the fallback. Results are relevance-ranked: multi-word queries match on any term (a row matching more terms ranks higher), and lineage-adjacent entities may surface as lower-ranked context even when their own text does not match. Prefer search for discovery, use paginated list tools only for browsing, and call the entity's single-resource `get` tool for full details.
 
 **Input**:
 | Parameter | Type | Required | Description |
@@ -580,6 +580,7 @@ Each task in the response includes the full TaskResponse format (with dependsOn,
 | scope | enum | No | Search scope: global, group, project (default: global) |
 | scopeUuid | string | No | Project group UUID (scope=group) or project UUID (scope=project) |
 | entityTypes | string[] | No | Entity types to search: task, idea, proposal, document, project, project_group (default: all) |
+| explain | boolean | No | Include per-result ranking provenance (default: false). Diagnostic — leave off unless investigating why something ranked where it did |
 
 **Output**:
 ```json
@@ -593,7 +594,8 @@ Each task in the response includes the full TaskResponse format (with dependsOn,
       "status": "open",
       "projectUuid": "...",
       "projectName": "Project A",
-      "updatedAt": "ISO timestamp"
+      "updatedAt": "ISO timestamp",
+      "score": 0.041946
     }
   ],
   "counts": {
@@ -613,6 +615,13 @@ Each task in the response includes the full TaskResponse format (with dependsOn,
 - Search in a project group: `{ query: "authentication", scope: "group", scopeUuid: "group-uuid" }`
 - Search in a specific project: `{ query: "authentication", scope: "project", scopeUuid: "project-uuid" }`
 - Search only tasks and ideas: `{ query: "authentication", entityTypes: ["task", "idea"] }`
+- Multi-word query: `{ query: "token refresh rotation" }` — matches rows carrying any of the terms, best-matching first
+- Diagnose ranking: `{ query: "authentication", explain: true }`
+
+**Notes on ranking**:
+- `score` is comparable **only within one response**; do not compare scores across calls. Exact-UUID lookups bypass ranking and report `0`.
+- `counts` is the total match count per type, so it can exceed the number of returned results.
+- A verified task, an approved proposal, and an ADR are nudged above equally relevant drafts or rejected work. This is a nudge, never a filter — a rejected proposal is still retrievable by a targeted query.
 
 **Discovery workflow**:
 1. Use `chorus_search` with a known UUID or a filtered text query.

@@ -230,8 +230,16 @@ Use @mentions to notify specific users or agents. Mention syntax: `@[DisplayName
 - `scope`: `"global"` (default) / `"group"` / `"project"`
 - `scopeUuid`: Project group UUID (when scope=group) or project UUID (when scope=project)
 - `entityTypes`: Array of entity types to search (default: all types)
+- `explain`: `false` (default) — set `true` to see why each result ranked where it did
 
 Prefer `chorus_search` for discovery, including exact UUID lookup. Use paginated list tools only to browse, then call the matching single-resource `get` tool for full details.
+
+**Results are relevance-ranked**, not recency-ordered:
+- Multi-word queries match rows carrying *any* term; rows matching more terms rank higher. You do not need to reduce a query to a single keyword.
+- Each result carries a `score`, comparable only within one response. Exact-UUID lookups report `0`.
+- `counts` is the total match count per type, so it can exceed the number of results returned.
+- Verified tasks, approved proposals, and ADRs are nudged above equally relevant drafts or rejected work — a nudge, never a filter, so rejected work is still findable.
+- Lineage-adjacent entities (a matching task's proposal, a proposal's tasks and documents, parent/child ideas, dependency neighbours) may appear as lower-ranked context even when their own text does not match the query.
 
 ### Notifications
 

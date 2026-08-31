@@ -23,6 +23,7 @@ export const GET = withErrorHandler(
     const scopeUuid = url.searchParams.get("scopeUuid") || undefined;
     const typesParam = url.searchParams.get("types");
     const limitParam = url.searchParams.get("limit");
+    const explain = url.searchParams.get("explain") === "true";
 
     // Validate required parameter: q
     if (!q || q.trim() === "") {
@@ -76,6 +77,7 @@ export const GET = withErrorHandler(
       scopeUuid,
       entityTypes,
       limit,
+      explain,
     });
 
     return success(result);
