@@ -48,11 +48,35 @@ describe("resolveAgentType — known backends", () => {
     expect(resolveAgentType({}, { CHORUS_AGENT: "dsh" })).toEqual({ ok: true, agent: "dsh" });
   });
 
+  it("accepts pi via --agent flag, CHORUS_AGENT env, and daemon.json", () => {
+    expect(resolveAgentType({ agent: "pi" }, {})).toEqual({ ok: true, agent: "pi" });
+    expect(resolveAgentType({}, { CHORUS_AGENT: "pi" })).toEqual({ ok: true, agent: "pi" });
+    expect(resolveAgentType({}, {}, { readJson: () => ({ agent: "pi" }), loginPath: "/x" })).toEqual({
+      ok: true,
+      agent: "pi",
+    });
+  });
+
   it("lists all backends in KNOWN_AGENTS and keeps claude-code default", () => {
     expect(KNOWN_AGENTS).toContain("claude-code");
     expect(KNOWN_AGENTS).toContain("codex");
     expect(KNOWN_AGENTS).toContain("kiro");
     expect(KNOWN_AGENTS).toContain("dsh");
+    expect(KNOWN_AGENTS).toContain("pi");
+    expect(DEFAULT_AGENT).toBe("claude-code");
+  });
+
+  it("accepts the non-wakeable 'offline' classification (KNOWN_AGENTS, flag/env/file), default unchanged", () => {
+    // 'offline' is a valid agentType so an agents[] entry / --agent can carry it;
+    // the daemon's fail-closed no-wake handling for it lives in spawner-select.
+    expect(KNOWN_AGENTS).toContain("offline");
+    expect(resolveAgentType({ agent: "offline" }, {})).toEqual({ ok: true, agent: "offline" });
+    expect(resolveAgentType({}, { CHORUS_AGENT: "offline" })).toEqual({ ok: true, agent: "offline" });
+    expect(resolveAgentType({}, {}, { readJson: () => ({ agent: "offline" }), loginPath: "/x" })).toEqual({
+      ok: true,
+      agent: "offline",
+    });
+    // Default is still claude-code — offline is never chosen implicitly.
     expect(DEFAULT_AGENT).toBe("claude-code");
   });
 });
@@ -150,8 +174,19 @@ describe("backendClientType — agentType → self-reported clientType", () => {
   it("maps dsh → dsh", () => {
     expect(backendClientType("dsh")).toBe("dsh");
   });
+  it("maps pi → pi", () => {
+    expect(backendClientType("pi")).toBe("pi");
+  });
   it("maps claude-code → claude_code", () => {
     expect(backendClientType("claude-code")).toBe("claude_code");
+  });
+  it("maps offline → offline (NOT claude_code — never self-reports as wakeable)", () => {
+    // offline must have an EXPLICIT case so it never falls through to the
+    // claude_code default and presents as a wakeable connection. The value is
+    // intentionally distinct from claude_code and outside the server's
+    // DAEMON_CLIENT_TYPES allowlist (fail-closed if ever sent).
+    expect(backendClientType("offline")).toBe("offline");
+    expect(backendClientType("offline")).not.toBe("claude_code");
   });
   it("falls back to claude_code for unknown/undefined", () => {
     expect(backendClientType(undefined)).toBe("claude_code");
@@ -166,8 +201,14 @@ describe("backendCli — agentType → executable descriptor", () => {
   it("maps kiro → kiro-cli / CHORUS_KIRO_PATH", () => {
     expect(backendCli("kiro")).toEqual({ name: "kiro-cli", envVar: "CHORUS_KIRO_PATH" });
   });
-  it("maps dsh → dsh-jsonrpc-agent / CHORUS_DSH_PATH", () => {
-    expect(backendCli("dsh")).toEqual({ name: "dsh-jsonrpc-agent", envVar: "CHORUS_DSH_PATH" });
+  it("maps dsh → dsh / CHORUS_DSH_PATH", () => {
+    expect(backendCli("dsh")).toEqual({ name: "dsh", envVar: "CHORUS_DSH_PATH" });
+  });
+  it("maps pi → pi / CHORUS_PI_PATH", () => {
+    expect(backendCli("pi")).toEqual({ name: "pi", envVar: "CHORUS_PI_PATH" });
+  });
+  it("maps offline → offline / CHORUS_AGENT (no real CLI, not mislabeled as claude)", () => {
+    expect(backendCli("offline")).toEqual({ name: "offline", envVar: "CHORUS_AGENT" });
   });
   it("falls back to claude / CHORUS_CLAUDE_PATH for default/unknown", () => {
     expect(backendCli("claude-code")).toEqual({ name: "claude", envVar: "CHORUS_CLAUDE_PATH" });

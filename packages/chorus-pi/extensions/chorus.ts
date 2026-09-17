@@ -9,18 +9,27 @@
  * Capabilities (mirrors the Claude Code plugin):
  *   - session_start          → chorus_checkin + context injection (SessionStart hook)
  *   - before_agent_start     → inject checkin result once (replaces UserPromptSubmit noise)
- *   - tool_call (subagent_spawn, pre-execution, MUTABLE input)
- *                            → create a Chorus session and inject its UUID + the session
- *                              workflow into the spawned worker's task. This is the
- *                              Pi-native equivalent of Claude's SubagentStart hook
+ *   - tool_call (subagent, pre-execution, MUTABLE input)
+ *                            → for each WORKER task in the `subagent` invocation
+ *                              (single / parallel / chain), create a Chorus session and
+ *                              inject its UUID + the session workflow into that task. This
+ *                              is the Pi-native equivalent of Claude's SubagentStart hook
  *                              injecting session context — a capability the Codex port
  *                              lacks (Codex has no pre-spawn mutation channel, so its
  *                              workers must manage sessions manually).
- *   - tool_execution_end     → reviewer nudges after submit_proposal / submit_for_verify
+ *   - tool_result            → close the ephemeral worker session(s) once the `subagent`
+ *   - tool_result            → for the official blocking subagent, close the ephemeral
+ *                              worker session(s) once the `subagent` tool call returns
+ *                              (spawn → run → exit within one tool call, so there is no
+ *                              persistent agentId and no separate close tool). For the
+ *                              nicobailon `pi-subagents` tool (async/detached by default,
+ *                              `details.asyncId` on tool_result) the sessions are deferred
+ *                              and closed on subagent:async-complete / process-terminal.
+ *                            → reviewer nudges after submit_proposal / submit_for_verify
  *                              / admin_verify_task (the 3 PostToolUse hooks)
- *                            → agentId→sessionUuid mapping on spawn result; close orphan
- *                              session on spawn error
- *                            → close the mapped session on subagent_manage close
+ *   - tool_execution_end     → fallback close of the worker session(s) if tool_result
+ *                              did not fire (idempotent — a successful close deletes the
+ *                              bookkeeping entry)
  *   - session_shutdown       → close stray sessions (SessionEnd hook)
  *
  * MCP: no installer needed. pi-mcp-adapter auto-discovers the repo's .mcp.json
@@ -33,10 +42,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   isWorkerAgent,
-  extractAgentId,
-  extractAgentIdFromToolResultEvent,
+  subagentTaskItems,
   sessionWorkflow,
-  detectOpenSpec,
+  hasSessionMarker,
+  extractRunIdFromToolResultEvent,
+  resolveSpecMode,
   buildSessionBanner,
   parseMaxCodeReviewRounds,
   resolveChorusBin,
@@ -67,7 +77,18 @@ const _mcp = _envUrl && _envKey
     })();
 const CHORUS_URL = _envUrl || _mcp.url;
 const CHORUS_API_KEY = _envKey || _mcp.apiKey;
-const OPENSPEC_OPTOUT = process.env.CHORUS_OPENSPEC_MODE === "off";
+
+// A neutral SpecModeResult for the not-configured / connection-failed banners,
+// where buildSessionBanner returns before reading the spec fields.
+const NO_SPEC = {
+  specMode: "off" as const,
+  specReason: "",
+  specFail: "",
+  openspecUsable: false,
+  openspecUsableReason: "",
+  openspecHint: "",
+  chorusOpenspecActive: false,
+};
 
 // Reviewer toggle envs (mirror Claude Code plugin userConfig; Pi has no plugin
 // settings UI, so env vars drive them). Defaults: all enabled.
@@ -90,6 +111,26 @@ const CHORUS_BIN = resolveChorusBin(import.meta.url, {
   existsSync: require("node:fs").existsSync,
 });
 const CONFIGURED = CHORUS_URL !== "" && CHORUS_API_KEY !== "";
+
+// Package version — single source of truth is the bundled package.json (kept in
+// lockstep with the Chorus app version at release), never a hardcoded literal.
+// Read once at load; falls back to "0.0.0" if unreadable so a broken read never
+// crashes the extension.
+const PKG_VERSION: string = (() => {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const _fs = require("node:fs");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const _path = require("node:path");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const _url = require("node:url");
+    const _dir = _path.dirname(_url.fileURLToPath(import.meta.url));
+    const _pkg = JSON.parse(_fs.readFileSync(_path.join(_dir, "..", "package.json"), "utf-8"));
+    return typeof _pkg.version === "string" ? _pkg.version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+})();
 
 // ─── MCP-over-HTTP helper (TS replacement for chorus-mcp-call.sh) ───────────
 let mcpSessionId: string | null = null;
@@ -119,7 +160,7 @@ async function mcpCall<T = unknown>(tool: string, args: Record<string, unknown> 
       params: {
         protocolVersion: "2025-03-26",
         capabilities: {},
-        clientInfo: { name: "chorus-pi", version: "0.16.4" },
+        clientInfo: { name: "chorus-pi", version: PKG_VERSION },
       },
     }),
   });
@@ -161,13 +202,21 @@ async function mcpCall<T = unknown>(tool: string, args: Record<string, unknown> 
   }
 }
 
-// ─── Session bookkeeping ──────────────────────────────────────────────────
-// agentId (sa_<uuid>, from subagent_spawn result) → Chorus sessionUuid
-const sessionMap = new Map<string, string>();
-// toolCallId → sessionUuid (pending between tool_call create and tool_result/tool_execution_end map)
-const pendingSessions = new Map<string, string>();
-// toolCallIds whose agentId→sessionUuid mapping was already done by tool_result (so tool_execution_end skips them)
-const spawnMapped = new Set<string>();
+// ─── Session bookkeeping (ephemeral subagent model) ────────────────────────
+// The official `subagent` tool spawns EPHEMERAL child pi processes (single /
+// parallel / chain) that run to completion within one tool call — there is no
+// persistent agentId and no separate `subagent_manage close` tool. So we create
+// a Chorus session for each WORKER task when the `subagent` tool call starts
+// (tool_call, mutable input → inject the session UUID + workflow into that task)
+// and close those sessions when the tool call finishes (tool_result, with
+// tool_execution_end as an idempotent fallback).
+//
+// toolCallId → the Chorus session UUIDs created for that `subagent` invocation.
+const callSessions = new Map<string, string[]>();
+// runId (nicobailon async/detached `subagent` runs) → sessionUuid(s); closed on
+// subagent:async-complete / subagent:process-terminal (blocking runs close at
+// tool_result via callSessions and never enter this map).
+const runIdToSid = new Map<string, string[]>();
 let checkinContext: string | null = null;
 let injectedOnce = false;
 
@@ -176,9 +225,11 @@ let injectedOnce = false;
 // error must NOT permanently leak the backend session). Only on success does
 // this run onSuccess (which drops the sessionMap/pendingSessions entry) and
 // report success. Returns whether the close succeeded.
+type NotifyCtx = { ui: { notify(msg: string, level: "info" | "warning" | "error"): void } };
+
 async function closeSessionOrRetain(
   sid: string,
-  ctx: { ui: { notify(msg: string, level: string): void } },
+  ctx: NotifyCtx,
   msgs: { fail: string; success: string; successLevel?: "info" | "warning" },
   onSuccess: () => void,
 ): Promise<boolean> {
@@ -193,15 +244,46 @@ async function closeSessionOrRetain(
   return true;
 }
 
+// Close every Chorus session created for a `subagent` tool call. Idempotent:
+// both tool_result and tool_execution_end call this for the same toolCallId, so
+// the entry is deleted only once all its sessions close. A session whose close
+// fails is retained in callSessions so a later event (or session_shutdown) can
+// retry it — a transient network/server error must NOT leak the backend session.
+async function closeCallSessions(
+  toolCallId: string,
+  ctx: NotifyCtx,
+): Promise<void> {
+  const sids = callSessions.get(toolCallId);
+  if (!sids || sids.length === 0) return;
+  const retained: string[] = [];
+  for (const sid of sids) {
+    const ok = await closeSessionOrRetain(
+      sid,
+      ctx,
+      {
+        fail: `Chorus: close failed for session ${sid.slice(0, 8)}… (will retry on shutdown)`,
+        success: `Chorus: closed session ${sid.slice(0, 8)}…`,
+      },
+      () => {},
+    );
+    if (!ok) retained.push(sid);
+  }
+  if (retained.length > 0) callSessions.set(toolCallId, retained);
+  else callSessions.delete(toolCallId);
+}
+
 
 // ─── Extension ────────────────────────────────────────────────────────────
 export default function (pi: ExtensionAPI) {
   // SessionStart → checkin + build context (replaces Claude's on-session-start.sh)
-  // Emits a user-visible one-line banner (ctx.ui.notify) mirroring the Claude
-  // plugin's SessionStart `systemMessage` / the Codex `$chorus` toast (#442):
-  //   connected + active   -> "Chorus connected at <url> (OpenSpec Enabled)"
-  //   connected + opt-out   -> "Chorus connected at <url> (OpenSpec off)"
-  //   connected + unset     -> "Chorus connected at <url> (OpenSpec off — run /skill:chorus enable openspec to set it up)"
+  // Resolves the spec mode once (resolveSpecMode, the TS mirror of the bash
+  // resolver) and injects a `## Spec Mode` block, plus a user-visible one-line
+  // banner (ctx.ui.notify) mirroring the Claude plugin `systemMessage` / Codex
+  // `$chorus` toast:
+  //   connected + openspec -> "Chorus connected at <url> (spec: OpenSpec)"
+  //   connected + lite      -> "Chorus connected at <url> (spec: spec-lite)"
+  //   connected + off       -> "Chorus connected at <url> (spec: off — free-form)"
+  //   connected + openspec-requested-but-unusable -> warning "(spec: OpenSpec requested but unusable — …)"
   //   not configured        -> warning (env vars missing)
   //   connection failed     -> error (checkin couldn't reach Chorus)
   pi.on("session_start", async (event, ctx) => {
@@ -211,7 +293,7 @@ export default function (pi: ExtensionAPI) {
         configured: false,
         connected: false,
         chorusUrl: CHORUS_URL,
-        openspec: { active: false, reason: "not configured", optout: false, hint: "" },
+        spec: NO_SPEC,
       });
       ctx.ui.notify(banner.message, banner.level);
       return;
@@ -220,13 +302,30 @@ export default function (pi: ExtensionAPI) {
     try {
       const checkin = await mcpCall("chorus_checkin");
       connected = true;
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const os = detectOpenSpec(
-        ctx.cwd,
-        OPENSPEC_OPTOUT,
+      // Resolve the spec mode once per session (single source of truth — the TS
+      // reimplementation of the bash resolver). Rule: explicit CHORUS_SPEC_MODE
+      // wins; unset → OpenSpec when usable, else spec-lite.
+      const spec = resolveSpecMode(
+        {
+          specMode: process.env.CHORUS_SPEC_MODE,
+          openspecMode: process.env.CHORUS_OPENSPEC_MODE,
+          enableOpenSpec: process.env.CLAUDE_PLUGIN_OPTION_ENABLEOPENSPEC,
+          projectRoot: ctx.cwd,
+        },
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
         require("node:fs"),
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
         require("node:child_process").execSync,
       );
+      // Route note per resolved mode (mirrors the bash/Codex `## Spec Mode` block).
+      const specRoute =
+        spec.specMode === "lite"
+          ? "Routing: lite → follow the `spec-lite` skill (/skill:spec-lite). A capability's durable spec is `.chorus/specs/<slug>/spec.md` (edited in place, **never synced**, git history is its record); each change is a dated folder `.chorus/specs/<slug>/<YYYY-MM-DD>-<change-slug>/` of Chorus-typed docs (`prd.md` required; `tech_design.md` / `adr.md` / `guide.md` / `spec.md` optional) that **are** mirrored 1:1 into persistent Chorus Documents via `chorus mcp call … --arg-file content=<file>` (fallback `chorus-mcp-call.sh`). Put a `Spec-lite: .chorus/specs/<slug>/<YYYY-MM-DD>-<change-slug>/` locator line in the proposal description. Do NOT scaffold `openspec/changes/` or add an `OpenSpec change slug:` line."
+          : spec.specMode === "off"
+            ? "Routing: off → free-form, no spec artifact. Do NOT create `.chorus/specs/` or `openspec/changes/` files; author document drafts inline via direct MCP."
+            : spec.specFail
+              ? `Routing: openspec → **cannot be honored** — ${spec.specFail}. The proposal / yolo skill MUST halt after resolving the mode; do NOT silently fall back to lite/free-form. Surface this to the user.${spec.openspecHint ? ` Install hint: ${spec.openspecHint}.` : ""}`
+              : `CHORUS_OPENSPEC_ACTIVE=1 (${spec.openspecUsableReason})\n\nRouting: openspec → load the openspec-aware skill (/skill:openspec-aware) and follow §3 (OpenSpec authoring) — do NOT re-run the §1 detection block, the answer is already known.\n\nCritical rule (openspec-aware §2 Rule 1): document mirror calls (\`chorus_pm_add_document_draft\` / \`chorus_pm_update_document_draft\` / \`chorus_pm_update_document\`) MUST fill \`content\` from the local file — prefer \`chorus mcp call <tool> '<json>' --arg-file content=<file>\`, falling back to \`chorus-mcp-call.sh\` when \`chorus\` is not on PATH. Do NOT invoke these MCP tools directly with hand-typed \`content\` in OpenSpec mode.`;
       checkinContext = [
         "# Chorus Plugin — Active",
         "",
@@ -238,32 +337,27 @@ export default function (pi: ExtensionAPI) {
         JSON.stringify(checkin, null, 2),
         "```",
         "",
-        "## OpenSpec Mode",
+        "## Spec Mode",
         "",
-        `CHORUS_OPENSPEC_ACTIVE=${os.active} (${os.reason})`,
-        os.active
-          ? "OpenSpec mode is **active**. proposal/develop/yolo skills follow the openspec-aware path."
-          : os.optout
-            ? "OpenSpec was **explicitly turned off** — do not nag."
-            : os.hint
-              ? `Note: this repo has an \`openspec/\` directory but the \`openspec\` CLI is not installed — ${os.hint}. Run \`/skill:chorus enable openspec\` to set it up.`
-              : "OpenSpec is not set up in this repo. Spec-driven authoring is optional — free-form works fine. If the user wants spec-driven mode, run `/skill:chorus enable openspec` (§6 walks the install + re-launch).",
+        `CHORUS_SPEC_MODE=${spec.specMode} (${spec.specReason})`,
+        "",
+        specRoute,
         "",
         "## Quick Reference",
-        "- **Sessions**: auto-managed. When you `subagent_spawn` a worker, the extension creates a Chorus session and injects its UUID + the session workflow into the worker's task automatically. When you `subagent_manage close` the agent, the extension closes the session. Do NOT call chorus_create_session/close_session yourself.",
+        "- **Sessions**: auto-managed. When you dispatch a WORKER via the `subagent` tool (single/parallel/chain), the extension creates a Chorus session per worker task and injects its UUID + the session workflow into that task automatically; the session is closed when the `subagent` tool call returns (children are ephemeral). Do NOT call chorus_create_session/close_session yourself.",
         "- **Notifications**: chorus_get_notifications() fetches and auto-marks read.",
         "- **Reviewer sub-agents**: after submit_proposal/submit_for_verify the extension nudges you to spawn chorus-proposal-reviewer / chorus-task-reviewer. Use the blocking `subagent` tool so it waits for the VERDICT; reviewers do NOT get a Chorus session.",
         "- **Code-review gateway**: bounded by `CHORUS_MAX_CODE_REVIEW_ROUNDS` (current: " + (MAX_CODE_REVIEW_ROUNDS === 0 ? "unlimited" : String(MAX_CODE_REVIEW_ROUNDS)) + "; on FAIL, fix via /skill:quick-dev and re-run — after the limit, escalate the Idea's feature-level BLOCKERs to a human instead of shipping.",
         (CHORUS_BIN
-          ? "- **OpenSpec wrapper**: `bin/chorus-mcp-call.sh` is at `" + CHORUS_BIN + "`. OpenSpec-mode document mirror calls MUST use this path (see /skill:openspec-aware §2). A bare `chorus-mcp-call.sh` will NOT be on PATH for local-path installs."
-          : "- **OpenSpec wrapper**: `bin/chorus-mcp-call.sh` was not resolved relative to the extension — fall back to `find ~/.pi/agent/npm -path '*chorus-pi/bin/chorus-mcp-call.sh'` (see /skill:openspec-aware §2)."),
-        "- **Skills**: /skill:chorus, /skill:idea, /skill:proposal, /skill:develop, /skill:review, /skill:quick-dev, /skill:yolo",
+          ? "- **OpenSpec wrapper**: `bin/chorus-mcp-call.sh` is at `" + CHORUS_BIN + "` — the CLI-absent fallback for OpenSpec-mode document mirrors. Prefer `chorus mcp call <tool> '<json>' --arg-file content=<file>` (chorus >= 0.17.0); use this wrapper only when `chorus` is not on PATH (a bare `chorus-mcp-call.sh` will NOT be on PATH for local-path installs). See /skill:openspec-aware §2."
+          : "- **OpenSpec wrapper**: `bin/chorus-mcp-call.sh` was not resolved relative to the extension — it is the CLI-absent fallback for OpenSpec-mode document mirrors (prefer `chorus mcp call <tool> '<json>' --arg-file content=<file>`). If you need it, locate it with `find ~/.pi/agent/npm -path '*chorus-pi/bin/chorus-mcp-call.sh'`. See /skill:openspec-aware §2."),
+        "- **Skills**: /skill:chorus, /skill:idea, /skill:proposal, /skill:develop, /skill:review, /skill:quick-dev, /skill:yolo, /skill:spec-lite, /skill:openspec-aware",
       ].join("\n");
       const banner = buildSessionBanner({
         configured: true,
         connected: true,
         chorusUrl: CHORUS_URL,
-        openspec: os,
+        spec,
       });
       ctx.ui.notify(banner.message, banner.level);
     } catch (e) {
@@ -272,7 +366,7 @@ export default function (pi: ExtensionAPI) {
         configured: true,
         connected: false,
         chorusUrl: CHORUS_URL,
-        openspec: { active: false, reason: "connection failed", optout: false, hint: "" },
+        spec: NO_SPEC,
       });
       ctx.ui.notify(banner.message, banner.level);
     }
@@ -288,79 +382,68 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
-  // tool_call (pre-execution, MUTABLE input) → create session + inject sessionUuid
-  // into the spawned worker's task. The spawned subprocess receives the UUID.
+  // tool_call (pre-execution, MUTABLE input) → for each WORKER task in the
+  // `subagent` invocation (single / parallel / chain), create a Chorus session
+  // and inject its UUID + the session workflow into that task. The ephemeral
+  // child pi subprocess spawned for that task receives the UUID in its prompt.
   pi.on("tool_call", async (event, _ctx) => {
-    if (!CONFIGURED || event.toolName !== "subagent_spawn") return;
-    const input = event.input as { agent?: string; task?: string };
-    const agentName = input?.agent ?? "";
+    if (!CONFIGURED || event.toolName !== "subagent") return;
     // Positive worker classification: only canonical worker agents get a Chorus
     // session + task-lifecycle injection. The three Chorus reviewers are not
-    // workers (read-only), and the built-in scout/planner/reviewer are read-only
-    // too — injecting the session workflow into them adds irrelevant instructions
-    // and unnecessary chorus_create_session traffic. See isWorkerAgent().
-    if (!isWorkerAgent(agentName) || !input.task) return;
-    try {
-      const session = await mcpCall<{ uuid?: string }>("chorus_create_session", { name: agentName });
-      if (!session?.uuid) return;
-      pendingSessions.set(event.toolCallId, session.uuid);
-      // Mutate the task in place — the spawned subprocess receives the UUID.
-      input.task = input.task + sessionWorkflow(session.uuid);
-    } catch {
-      // Non-fatal: worker runs without observability (same as Codex fallback).
+    // workers (read-only), and the example scout/planner/reviewer agents are
+    // read-only too — injecting the session workflow into them adds irrelevant
+    // instructions and unnecessary chorus_create_session traffic. See isWorkerAgent().
+    const created: string[] = [];
+    for (const item of subagentTaskItems(event.input)) {
+      if (!isWorkerAgent(item.agent)) continue;
+      // Manual main-agent template already injected — never double-inject.
+      if (hasSessionMarker(item.task)) continue;
+      try {
+        const session = await mcpCall<{ uuid?: string }>("chorus_create_session", { name: item.agent });
+        if (!session?.uuid) continue;
+        created.push(session.uuid);
+        // Mutate the task in place — the ephemeral child receives the UUID.
+        item.setTask(item.task + sessionWorkflow(session.uuid));
+      } catch {
+        // Non-fatal: worker runs without observability (same as Codex fallback).
+      }
     }
+    if (created.length > 0) callSessions.set(event.toolCallId, created);
   });
   // tool_result (fires first; has input + details + content as first-class fields)
-  // → PRIMARY handler for BOTH ends of the session lifecycle:
-  //   - subagent_spawn  → map agentId → sessionUuid (from event.details.agent.id)
-  //   - subagent_manage {action:"close"} → close the mapped session (from event.input)
-  // Per pi source (agent-session.js afterToolCall), emitToolResult receives
-  // `input: args, content: result.content, details: result.details` directly from
-  // the tool's return — NOT nested under `result` like tool_execution_end, and
-  // `input` IS present (unlike tool_execution_end which has no input field).
+  // → PRIMARY handler that closes the ephemeral worker session(s) once a `subagent`
+  //   tool call returns. The official subagent children are ephemeral (spawn → run
+  //   → exit within one tool call), so the session lifecycle collapses to
+  //   "create on tool_call start, close on tool_result".
+  // → Also fires reviewer nudges after the 3 chorus_* submit/verify tools.
   pi.on("tool_result", async (event, ctx) => {
-    if (!CONFIGURED || event.isError) return;
+    if (!CONFIGURED) return;
 
-    // ── subagent_spawn → map agentId → sessionUuid ─────────────────────
-    if (event.toolName === "subagent_spawn") {
-      const sid = pendingSessions.get(event.toolCallId);
-      if (!sid) return;
-      const agentId = extractAgentIdFromToolResultEvent(event);
-      if (agentId) {
-        sessionMap.set(agentId, sid);
-        spawnMapped.add(event.toolCallId);
-        ctx.ui.notify(`Chorus session: ${sid.slice(0, 8)}… (worker ${agentId.slice(0, 11)}…)`, "info");
-      } else {
-        // tool_result had the best shot and still failed — log for diagnostics.
-        // tool_execution_end will try event.result as a last resort.
-        console.error("[chorus-pi] tool_result could not extract agentId. event keys:",
-          Object.keys(event), "details:", event.details, "content:", event.content?.map((c: any) => c?.text));
+    // ── subagent tool finished → close the worker session(s) ───────────
+    // The official blocking subagent closes sessions at tool_result; the
+    // nicobailon `pi-subagents` tool is async (detached) by default, so its
+    // tool_result carries `details.asyncId` and the run completes later via
+    // the pi event bus — in that case move the sessions to runIdToSid and
+    // let subagent:async-complete / subagent:process-terminal close them.
+    if (event.toolName === "subagent") {
+      const runId = extractRunIdFromToolResultEvent(event);
+      if (runId) {
+        const sids = callSessions.get(event.toolCallId);
+        if (sids && sids.length > 0) {
+          runIdToSid.set(runId, [...(runIdToSid.get(runId) ?? []), ...sids]);
+          callSessions.delete(event.toolCallId);
+          ctx.ui.notify(`Chorus session(s): ${sids.map((s) => s.slice(0, 8)).join(",")}… deferred to async run ${runId.slice(0, 8)}…`, "info");
+        }
+        return;
       }
+      // Blocking run (or no run id) — close now. closeCallSessions is
+      // idempotent and retains any session whose close fails for a shutdown retry.
+      await closeCallSessions(event.toolCallId, ctx);
       return;
     }
 
-    // ── subagent_manage {action:"close"} → close the mapped session ───
-    // tool_result has event.input (ToolResultEventBase.input) — tool_execution_end does NOT.
-    if (event.toolName === "subagent_manage") {
-      const input = event.input as { action?: string; agentId?: string };
-      if (input?.action !== "close" || !input.agentId) return;
-      const sid = sessionMap.get(input.agentId);
-      if (sid) {
-        // Close the backend session. Only drop the mapping and report success on
-        // a successful close — a transient network/server failure must NOT delete the
-        // mapping, otherwise session_shutdown (which iterates sessionMap.values())
-        // cannot retry and the backend session leaks permanently. (Reviewer P1.)
-        await closeSessionOrRetain(sid, ctx, {
-          fail: `Chorus: close failed for session ${sid.slice(0, 8)}… (will retry on shutdown)`,
-          success: `Chorus: closed session ${sid.slice(0, 8)}…`,
-        }, () => sessionMap.delete(input.agentId));
-      } else {
-        // No mapping for this agentId — either it was a reviewer (no session),
-        // the spawn mapping failed, or the agent predated this session.
-        ctx.ui.notify(`Chorus: no session mapped to ${input.agentId.slice(0, 11)}… — nothing to close`, "warning");
-      }
-      return;
-    }
+    // Reviewer nudges only fire on a successful chorus_* call.
+    if (event.isError) return;
 
     // ── Reviewer nudges (the 3 Claude PostToolUse hooks) ──────────────
     // In MCP gateway mode event.toolName === "mcp" and the real chorus tool
@@ -389,78 +472,88 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // tool_execution_end → FALLBACK agentId extraction + error cleanup + reviewer nudges
-  // NOTE: this event has NO `input` field (per pi ToolExecutionEndEvent type).
-  // subagent_manage close is handled in tool_result above, not here.
+  // tool_execution_end → idempotent FALLBACK close of the worker session(s).
+  // tool_result normally fires first and already closed (and deleted) them, so
+  // this is a no-op in the common case. It exists so that if tool_result did not
+  // fire — or its close failed and retained the session — the sessions are still
+  // closed (or retried) here rather than leaking until session_shutdown.
+  // NOTE: this event has NO `input` field (per pi ToolExecutionEndEvent type),
+  // so reviewer nudges (which need event.input to resolve the chorus tool name in
+  // MCP gateway mode) are handled in tool_result above, not here.
   pi.on("tool_execution_end", async (event, ctx) => {
     if (!CONFIGURED) return;
-
-    // ── subagent_spawn result: map agentId → sessionUuid (or close orphan on error)
-    if (event.toolName === "subagent_spawn") {
-      const sid = pendingSessions.get(event.toolCallId);
-      if (!sid) return;
-      if (event.isError) {
-        // Spawn failed — close the orphan session. Retain the sid in pendingSessions
-        // if the close fails so session_shutdown can retry it (no permanent leak).
-        await closeSessionOrRetain(sid, ctx, {
-          fail: `Chorus: close failed for orphan session ${sid.slice(0, 8)}… (will retry on shutdown)`,
-          success: `Chorus: closed orphan session ${sid.slice(0, 8)}… (spawn error)`,
-        }, () => pendingSessions.delete(event.toolCallId));
-        return;
-      }
-      // tool_result already mapped this one — nothing to do.
-      if (spawnMapped.has(event.toolCallId)) {
-        spawnMapped.delete(event.toolCallId);
-        pendingSessions.delete(event.toolCallId);
-        return;
-      }
-      // Fallback: tool_result didn't fire or couldn't extract. Try event.result.
-      const agentId = extractAgentId(event.result);
-      if (agentId) {
-        sessionMap.set(agentId, sid);
-        pendingSessions.delete(event.toolCallId);
-        ctx.ui.notify(`Chorus session: ${sid.slice(0, 8)}… (worker ${agentId.slice(0, 11)}…)`, "info");
-      } else {
-        // Extraction failed on BOTH events (tool_result + tool_execution_end).
-        // Try to close the orphan session. Retain the sid in pendingSessions if
-        // the close fails so session_shutdown can retry it (no permanent leak).
-        const closed = await closeSessionOrRetain(sid, ctx, {
-          fail: `Chorus: close failed for orphan session ${sid.slice(0, 8)}… (will retry on shutdown)`,
-          success: `Chorus: closed orphan session ${sid.slice(0, 8)}… (could not extract agentId, worker task ran without observability)`,
-          successLevel: "warning",
-        }, () => pendingSessions.delete(event.toolCallId));
-        // Diagnostic: log the actual result shape so the runtime contract can be
-        // confirmed — and state accurately whether the orphan was closed or
-        // retained in pendingSessions for a shutdown retry.
-        console.error(`[chorus-pi] FALLBACK also failed — orphan session ${closed ? "closed" : "close failed; retained for shutdown retry"}.`, "result type:", typeof event.result,
-          "keys:", event.result && typeof event.result === "object" ? Object.keys(event.result) : "n/a",
-          "result:", JSON.stringify(event.result)?.slice(0, 300));
-      }
-      return;
+    if (event.toolName === "subagent") {
+      // tool_result already moved async sessions to runIdToSid — nothing left
+      // in callSessions for them. Blocking runs (or failed injection) close here.
+      await closeCallSessions(event.toolCallId, ctx);
     }
-
-    // subagent_manage close is handled in tool_result (which has event.input);
-    // tool_execution_end has no input field, so there is nothing to do here for manage.
-
-    // tool_execution_end has no input field, so there is nothing to do here for manage.
-
-    // tool_execution_end has no input field, so there is nothing to do here for manage.
-
-    // Reviewer nudges are handled in tool_result above (which has event.input,
-    // needed to resolve the real chorus tool name in MCP gateway mode).
   });
 
-  // SessionEnd → close any stray sessions (replaces Claude's on-session-end.sh)
+  // ── nicobailon async/detached `subagent` runs: close by runId ──────
+  // tool_result deferred these sessions to runIdToSid; completion arrives on
+  // the pi event bus. Delete the mapping BEFORE issuing the close so a
+  // duplicate lifecycle event cannot double-close; re-add on failure so the
+  // shutdown sweep can still retry it.
+  //
+  // In-flight closes are tracked so session_shutdown can await them before
+  // sweeping: a close that fails after the sweep ran would otherwise re-add
+  // its entry after the map was cleared (retry lost + stale entry).
+  const inflightCloses = new Set<Promise<void>>();
+  const closeRunSessions = (runId: string): void => {
+    const sids = runIdToSid.get(runId);
+    if (!sids || sids.length === 0) return;
+    runIdToSid.delete(runId);
+    const p: Promise<void> = (async () => {
+      const failed: string[] = [];
+      for (const sid of sids) {
+        try { await mcpCall("chorus_close_session", { sessionUuid: sid }); } catch { failed.push(sid); }
+      }
+      if (failed.length > 0) {
+        runIdToSid.set(runId, failed);
+        console.warn(`[chorus-pi] failed to close ${failed.length} session(s) for run ${runId}: ${failed.join(", ")} — will retry at session_shutdown`);
+      }
+    })();
+    inflightCloses.add(p);
+    void p.finally(() => inflightCloses.delete(p));
+  };
+  // Only `runId` is trusted on async-complete; `id` (runId-or-id shape) is
+  // accepted only on process-terminal, since async-complete could carry an
+  // unrelated id field alongside runId.
+  const eventBusRunId = (data: unknown, allowId: boolean): string | null => {
+    const d = (data ?? {}) as Record<string, unknown>;
+    if (typeof d.runId === "string" && d.runId) return d.runId;
+    if (allowId && typeof d.id === "string" && d.id) return d.id;
+    return null;
+  };
+  pi.events.on("subagent:async-complete", (data) => {
+    const runId = eventBusRunId(data, false);
+    if (runId) closeRunSessions(runId);
+  });
+  pi.events.on("subagent:process-terminal", (data) => {
+    const runId = eventBusRunId(data, true);
+    if (runId) closeRunSessions(runId);
+  });
+
+  // SessionEnd → close any stray worker sessions (replaces Claude's on-session-end.sh).
+  // Retries every session still tracked in callSessions (e.g. a subagent call whose
+  // close failed and was retained, or that never saw a tool_result/tool_execution_end).
   pi.on("session_shutdown", async () => {
-    for (const sid of sessionMap.values()) {
-      await mcpCall("chorus_close_session", { sessionUuid: sid }).catch(() => {});
+    // Wait for in-flight async closes to settle FIRST: a close that fails
+    // re-adds into runIdToSid, and the sweep below must see it (otherwise the
+    // retry is lost and a stale entry survives the clear).
+    await Promise.allSettled([...inflightCloses]);
+    for (const sids of callSessions.values()) {
+      for (const sid of sids) {
+        await mcpCall("chorus_close_session", { sessionUuid: sid }).catch(() => {});
+      }
     }
-    for (const sid of pendingSessions.values()) {
-      await mcpCall("chorus_close_session", { sessionUuid: sid }).catch(() => {});
+    for (const sids of runIdToSid.values()) {
+      for (const sid of sids) {
+        await mcpCall("chorus_close_session", { sessionUuid: sid }).catch(() => {});
+      }
     }
-    sessionMap.clear();
-    pendingSessions.clear();
-    spawnMapped.clear();
+    callSessions.clear();
+    runIdToSid.clear();
     injectedOnce = false;
     checkinContext = null;
     mcpSessionId = null;

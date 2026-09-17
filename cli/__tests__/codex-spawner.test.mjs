@@ -173,6 +173,7 @@ describe("CodexSpawner.wake — spawn orchestration", () => {
     getUsageSnapshot,
     setUsageSnapshot,
     codexPath = "/usr/bin/codex",
+    creds: credsOverride = creds,
   } = {}) {
     const calls = {};
     const spawnImpl = vi.fn((command, argv, opts) => {
@@ -185,7 +186,7 @@ describe("CodexSpawner.wake — spawn orchestration", () => {
       codexPath,
       spawnImpl,
       permissionMode,
-      creds,
+      creds: credsOverride,
       platform: "linux",
       logger: { info() {}, warn() {}, error() {} },
       getThreadIdFn: getThreadId ?? (() => null),
@@ -216,6 +217,8 @@ describe("CodexSpawner.wake — spawn orchestration", () => {
     expect(calls.opts.env.CHORUS_URL).toBe("https://chorus.test");
     expect(calls.opts.env.CHORUS_API_KEY).toBe("cho_secret");
     expect(calls.opts.env.CHORUS_DAEMON_HEADLESS).toBe("1");
+    // No identity on these creds → no profile exported (the wrapper falls back to url+key).
+    expect(calls.opts.env.CHORUS_AGENT_PROFILE).toBeUndefined();
     expect(calls.argv.join(" ")).not.toContain("cho_secret");
     // detached process group on POSIX (for interrupt parity)
     expect(calls.opts.detached).toBe(true);
@@ -226,6 +229,22 @@ describe("CodexSpawner.wake — spawn orchestration", () => {
     expect(result.exitCode).toBe(0);
     expect(result.sessionId).toBe(ANCHOR);
     expect(result.backendSessionId).toBe(TID);
+  });
+
+  it("exports the agent identity as CHORUS_AGENT_PROFILE (uuid) when creds carry it", async () => {
+    const child = makeFakeChild();
+    const { spawner, calls } = makeSpawner({
+      child,
+      creds: { url: "https://chorus.test", apiKey: "cho_secret", agentUuid: "u-codex", agentName: "Codex" },
+    });
+    const p = spawner.wake({ prompt: "x", sessionId: ANCHOR, isNew: true });
+    child.stdout.emit("data", JSON.stringify({ type: "thread.started", thread_id: TID }) + "\n");
+    child.emit("close", 0);
+    await p;
+    // The woken session gets its identity; the uuid is preferred over the name.
+    expect(calls.opts.env.CHORUS_AGENT_PROFILE).toBe("u-codex");
+    // …and never leaked into argv.
+    expect(calls.argv.join(" ")).not.toContain("u-codex");
   });
 
   it("overwrites stale inherited Chorus connection values", async () => {
@@ -339,14 +358,21 @@ describe("CodexSpawner.wake — spawn orchestration", () => {
     expect(setThreadId).not.toHaveBeenCalled();
   });
 
-  it("resume wake: a known anchor produces `exec resume <thread_id>` (ignores passed isNew)", async () => {
+  it.each([
+    "/workspaces/项目 alpha",
+    "/workspaces/space only",
+  ])("resume wake: a known anchor ignores the shared new-session probe under cwd %s", async (cwd) => {
     const child = makeFakeChild();
     const { spawner, calls } = makeSpawner({ child, getThreadId: () => TID });
-    // pass isNew:true but the map has a thread id → spawner must resume
-    const p = spawner.wake({ prompt: "again", sessionId: ANCHOR, isNew: true });
+    // pass isNew:true (the shared Claude probe missed) but the map has a thread
+    // id → Codex must resume independently and pass the cwd through verbatim.
+    const p = spawner.wake({ prompt: "again", sessionId: ANCHOR, isNew: true, cwd });
     child.emit("close", 0);
-    await p;
+    const result = await p;
+    expect(spawner.sessionDecision).toEqual({ probeIsAuthoritative: false });
     expect(calls.argv.slice(0, 3)).toEqual(["exec", "resume", TID]);
+    expect(calls.opts.cwd).toBe(cwd);
+    expect(result).toMatchObject({ backendSessionId: TID, isNew: false });
   });
 
   it("forwards each parsed event to onMessage", async () => {

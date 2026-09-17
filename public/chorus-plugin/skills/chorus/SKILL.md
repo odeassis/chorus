@@ -4,7 +4,7 @@ description: Chorus AI Agent collaboration platform — overview, common tools, 
 license: AGPL-3.0
 metadata:
   author: chorus
-  version: "0.16.4"
+  version: "0.18.1"
   category: project-management
   mcp_server: chorus
 ---
@@ -149,7 +149,7 @@ Projects can be organized into **Project Groups** — a single-level grouping th
 
 ### Reports
 
-A **report** is a short idea-completion summary persisted as a `type="report"` Document at end-of-Idea, authored via `chorus_create_report` (gated on `document:write`). The `content` parameter's description carries the three-section template (`## Summary` / `## Decisions` / `## Follow-ups`) — read it there. `/yolo` writes one mandatorily; `/develop` offers it advisorily on last-task verify; a PostToolUse hook reminds if neither fired.
+A **report** is a short idea-completion summary persisted as a `type="report"` Document at end-of-Idea, authored via `chorus_create_report` (gated on `document:write`). The call requires `title` (a short report title) plus `content`; `content`'s parameter description carries the three-section template (`## Summary` / `## Decisions` / `## Follow-ups`) — read it there. `/yolo` writes one mandatorily; `/develop` offers it advisorily on last-task verify; a PostToolUse hook reminds if neither fired.
 
 ### References
 
@@ -352,9 +352,13 @@ To disable, reconfigure the plugin via `/plugin` settings or manually edit `~/.c
 
 When enabled, reviewers run as read-only sub-agents and post a VERDICT comment on the proposal/task/idea. Three possible outcomes: **PASS** (no issues), **PASS WITH NOTES** (minor non-blocking notes), or **FAIL** (BLOCKERs found). Results are advisory — they do not block approval, verification, or ship; the code-review gateway in particular is behavioral (it does not change the Idea's stored status). On a code-review FAIL, fix it via the `/chorus:quick-dev` workflow: `chorus_create_tasks` with `proposalUuid` set to the current approved proposal so the fix tasks attach to it. Group related small BLOCKERs into one cohesive task by default; split only materially large or independently testable fixes. Each fix task must self-check its acceptance criteria and pass independent task review plus admin verification. Re-run the gateway only after every fix task is successfully `done`; if there is a failed or cancelled fix task, stop and escalate instead. Disabling reduces token usage but removes the independent quality gate.
 
-### 6. Enable OpenSpec Mode (Optional)
+**First-principles alignment (a stage-tailored instruction in all three reviewers).** Each reviewer also checks, top-down, that the work still serves the *original Idea's intent*. It resolves the Idea from the entity under review (proposal-reviewer → the proposal's `inputUuids[0]`; task-reviewer → its proposal's `inputUuids[0]`; code-reviewer → the given `ideaUuid`), reads it with the existing `chorus_get_idea` + `chorus_get_elaboration` + `chorus_get_comments`, and builds the intent **baseline** from **human input only** — the Idea content + elaboration answers where `answeredBy.type == "user"` + comments where `author.type == "user"`. Agent-answered elaboration and agent-authored comments are audit context only: they cannot expand, shrink, or override the baseline. It flags **scope creep** (work beyond intent), **requirement loss / shrink** (intent dropped or reduced), or **semantic drift** (passes AC but misses the point). Unauthorized drift is a **BLOCKER → VERDICT: FAIL / reject**, downgraded to a cited `NOTE` only when traceable to a **human** authorization: a human-authored Idea comment (`author.type == "user"`), a human-answered elaboration entry (`answeredBy.type == "user"`), or an explicit human override at the gate. **An agent's own comment never authorizes**, so a drifting agent cannot self-clear. The alignment finding folds into the existing VERDICT; the dimension is skipped when the entity has no attached Idea.
 
-Opt-in spec-driven path: `/proposal`, `/develop`, `/yolo` write `proposal.md` / `design.md` / spec deltas on disk and mirror them into Chorus drafts. Fully optional — free-form authoring works without it. Activates only when all three hold: the `enableOpenSpec` toggle is on (default) and `CHORUS_OPENSPEC_MODE` ≠ `off`, an `openspec/` directory exists at the project root, and the `openspec` CLI is on `PATH`.
+### 6. Spec mode: OpenSpec (default when usable) vs spec-lite (fallback)
+
+The SessionStart hook resolves one **spec mode** per session and prints a `## Spec Mode` section stating it. Resolution: an explicit `CHORUS_SPEC_MODE` (`lite`/`openspec`/`off`) wins; when unset, **OpenSpec is the default whenever it is usable** — the `enableOpenSpec` toggle on (default) and `CHORUS_OPENSPEC_MODE` ≠ `off`, an `openspec/` directory at the project root, and the `openspec` CLI on `PATH`. When OpenSpec is absent or disabled, the mode falls back to **spec-lite** — a Chorus-native, git-tracked model: a durable local spec `.chorus/specs/<slug>/spec.md` per capability (edited in place, **never synced** to Chorus), plus one dated folder per change effort `.chorus/specs/<slug>/<YYYY-MM-DD>-<change-slug>/` of plain-markdown docs named by Document type (`prd.md`, `tech_design.md`, …), each of those dated-folder docs mirrored 1:1 into a persistent Chorus Document (see the `spec-lite` skill). `CHORUS_SPEC_MODE=off` selects free-form (no spec artifact).
+
+OpenSpec spec-driven path: `/proposal`, `/develop`, `/yolo` write `proposal.md` / `design.md` / spec deltas on disk and mirror them into Chorus drafts.
 
 **When the user wants it on** (e.g. they ran `/chorus enable openspec` after the `(OpenSpec off — …)` banner), actually **enable it for them** — run whichever steps are missing, don't just describe them:
 
@@ -363,9 +367,27 @@ npm i -g @fission-ai/openspec       # 1. install the CLI if it's not on PATH (gl
 openspec init --tools claude        # 2. scaffold openspec/ + wire up Claude Code's native commands/skills
 ```
 
-`openspec init` is interactive if you omit `--tools`; pass `--tools claude` to run it unattended. Chorus's detection only needs the `openspec/` directory, but wiring up Claude Code also gives OpenSpec its own commands + skills. The OpenSpec signal is read **once at SessionStart**, so it can't flip mid-session — after the steps succeed, tell the user to **re-launch the session**; the banner then reads `(OpenSpec Enabled)` and the stage skills fold in the `openspec-aware` skill automatically.
+`openspec init` is interactive if you omit `--tools`; pass `--tools claude` to run it unattended. Chorus's detection only needs the `openspec/` directory, but wiring up Claude Code also gives OpenSpec its own commands + skills. The spec mode is resolved **once at SessionStart**, so it can't flip mid-session — after the steps succeed, tell the user to **re-launch the session**; the `## Spec Mode` section then reads `CHORUS_SPEC_MODE=openspec (…)` and the stage skills fold in the `openspec-aware` skill automatically.
 
-To turn it off, flip `enableOpenSpec` to `false` or set `CHORUS_OPENSPEC_MODE=off` — the banner then reads a neutral `(OpenSpec off)`.
+To turn OpenSpec off, flip `enableOpenSpec` to `false` or set `CHORUS_OPENSPEC_MODE=off` — the mode then falls back to **spec-lite** (or set `CHORUS_SPEC_MODE=off` for free-form). The `## Spec Mode` section always states the resolved mode + reason.
+
+### 7. Daemon auto-start via `chorus agents add`
+
+`chorus agents add` runs an ordered set of steps to wire this machine to Chorus. Its final step — **daemon-setup** — configures the local Chorus daemon and, opt-in, installs it as a boot-autostart service.
+
+- **What it configures.** Reusing the same preflight as `chorus daemon install`, it persists the served working directories (`cwds`) and the default backend agent into `~/.chorus/daemon.json`. Credentials are the **connection credentials only** — the Chorus URL + API key (`cho_…`) seeded earlier in the run. `chorus agents add` never collects or stores model-provider secrets (see the limitation below).
+- **Opt-in auto-start.**
+  - Interactive (TTY): it asks *"Install & enable the Chorus daemon to auto-start on boot?"* — **default No**. Answer yes to install.
+  - Non-interactive (non-TTY, or `--yes`): it installs the boot service **only** when you pass `--daemon-autostart`; otherwise it writes `~/.chorus/daemon.json` and leaves starting the daemon to you (`chorus daemon`).
+- **Platform support.** Auto-start is a *real* boot service on **Linux (systemd `--user`)** and **macOS (launchd LaunchAgent)** — both start now and at every login. On other platforms (e.g. Windows) it writes the config and prints the manual start steps instead of installing anything.
+- **Idempotent.** Re-running when the service is already installed reports it as already configured and changes nothing.
+- **Manage it.** `chorus daemon status | stop | restart | logs` transparently delegate to the installed supervisor (`systemctl --user` on Linux, `launchctl` on macOS); with no service installed they operate on the `chorus daemon -d` pidfile/log as before.
+
+> **⚠️ Provider credentials on a boot service (important).** A boot-launched daemon (systemd `--user` or launchd) starts in a **clean environment** and does **not** inherit your shell-exported model-provider secrets (`ANTHROPIC_API_KEY`, `AWS_*` / `CLAUDE_CODE_USE_BEDROCK`, etc.). Chorus keeps `daemon.json` to the Chorus connection credentials only, so you must supply provider credentials to the service's environment yourself:
+> - **Linux (systemd):** add a drop-in `~/.config/systemd/user/chorus-daemon.service.d/env.conf` containing `[Service]` + `Environment=ANTHROPIC_API_KEY=…` then `systemctl --user daemon-reload && systemctl --user restart chorus-daemon.service`; or place the vars in `~/.config/environment.d/*.conf`.
+> - **macOS (launchd):** `launchctl setenv ANTHROPIC_API_KEY …` (before load), or add an `EnvironmentVariables` dict to `~/Library/LaunchAgents/com.chorus.daemon.plist`.
+>
+> Without this, a boot-started daemon reaches Chorus fine but its spawned agents may fail to reach the model provider.
 
 ---
 
@@ -428,7 +450,8 @@ This is the core overview skill. For stage-specific workflows, use:
 | **Development** | `/develop` | Claim Tasks, report work, session & sub-agent management, Agent Teams integration |
 | **Review** | `/review` | Approve/reject Proposals, verify Tasks, project governance |
 | **Docs** | `/docs` | Consult the live Chorus documentation site to answer product-usage questions — UI workflow, agent/plugin setup, API/MCP, deployment, operations |
-| **OpenSpec mode** | `openspec-aware` | Opt-in **shared sub-procedure** invoked by `/proposal`, `/develop`, and `/yolo` whenever the user has the `openspec` CLI installed. Scaffolds `openspec/changes/<slug>/` on disk and mirrors files into Chorus document drafts via the `chorus-api.sh` wrapper. Skips silently in fallback mode. See `.claude/skills/openspec-aware/SKILL.md`. |
+| **OpenSpec mode** | `openspec-aware` | **Shared sub-procedure** invoked by `/proposal`, `/develop`, and `/yolo` when the resolved spec mode is a usable OpenSpec (the default when `openspec/` + CLI present and not disabled). Scaffolds `openspec/changes/<slug>/` on disk and mirrors files into Chorus document drafts via the `chorus-api.sh` wrapper. No-op when the mode isn't a usable OpenSpec. See `.claude/skills/openspec-aware/SKILL.md`. |
+| **spec-lite mode** | `spec-lite` | **Shared sub-procedure** and the fallback when OpenSpec isn't usable (or `CHORUS_SPEC_MODE=lite`). Durable local `.chorus/specs/<slug>/spec.md` (never synced) + dated per-change folders of Chorus-typed docs mirrored 1:1 into Chorus via `--arg-file`. No CLI/validation/archive. See `.claude/skills/spec-lite/SKILL.md`. |
 
 ### Getting Started
 

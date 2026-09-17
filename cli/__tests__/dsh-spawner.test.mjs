@@ -3,13 +3,15 @@ import { describe, expect, it, vi } from "vitest";
 import {
   DshSpawner,
   addDshUsage,
-  resolveDshConfig,
+  resolveDshHome,
   resolveDshPath,
 } from "../dsh-spawner.mjs";
 
 const CREDS = { url: "https://chorus.test", apiKey: "cho_secret" };
 const UUID = "11111111-2222-4333-8444-555555555555";
 const SID = "chorus-11111111222243338444555555555555";
+const UUID2 = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const SID2 = "chorus-aaaaaaaabbbb4ccc8dddeeeeeeeeeeee";
 
 function response(id, result) {
   return `${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`;
@@ -40,7 +42,7 @@ function fakeChild(onRequest) {
   return child;
 }
 
-function successfulRuntime() {
+function successfulRuntime(sessionId = SID) {
   return fakeChild((request, child) => {
     queueMicrotask(() => {
       if (request.method === "initialize") {
@@ -55,14 +57,14 @@ function successfulRuntime() {
         child.stdout.emit(
           "data",
           notification("session.event", {
-            sessionId: SID,
+            sessionId,
             event: {
               type: "agent/inbox/spliced",
               data: { inserted: [{ id: "msg-1" }] },
             },
           }) +
             notification("session.event", {
-              sessionId: SID,
+              sessionId,
               event: {
                 type: "user/message",
                 data: { message: { role: "user", content: [{ type: "text", text: "hello" }] } },
@@ -85,7 +87,7 @@ function successfulRuntime() {
         child.stdout.emit(
           "data",
           notification("session.event", {
-            sessionId: SID,
+            sessionId,
             event: {
               type: "assistant/message",
               data: {
@@ -95,7 +97,7 @@ function successfulRuntime() {
             },
           }) +
             notification("session.event", {
-              sessionId: SID,
+              sessionId,
               event: {
                 type: "assistant/message",
                 data: {
@@ -117,7 +119,7 @@ function successfulRuntime() {
         child.stdout.emit("data", response(request.id, { messageId: "msg-1" }));
         child.stdout.emit(
           "data",
-          notification("session.status", { sessionId: SID, status: "idle" }),
+          notification("session.status", { sessionId, status: "idle" }),
         );
       } else if (request.method === "shutdown") {
         child.stdout.emit("data", response(request.id, {}));
@@ -132,10 +134,10 @@ function makeSpawner(overrides = {}) {
   const calls = {};
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
   const spawner = new DshSpawner({
-    dshPath: "/opt/dsh-jsonrpc-agent",
+    dshPath: "/opt/dsh",
     env: {
       PATH: "/bin",
-      CHORUS_DSH_CONFIG: "/secure/cordis.yml",
+      CHORUS_DSH_HOME: "/managed/home",
       CHORUS_DSH_MODEL: "model-x",
     },
     platform: "linux",
@@ -154,7 +156,7 @@ function makeSpawner(overrides = {}) {
 }
 
 describe("dsh runtime discovery and usage", () => {
-  it("uses CHORUS_DSH_PATH before PATH and supports both config env names", () => {
+  it("uses CHORUS_DSH_PATH before PATH and resolves the `dsh` CLI (not the removed agent bin)", () => {
     expect(
       resolveDshPath({
         env: { CHORUS_DSH_PATH: "/override/dsh", PATH: "/a:/b" },
@@ -166,11 +168,20 @@ describe("dsh runtime discovery and usage", () => {
       resolveDshPath({
         env: { PATH: "/a:/b" },
         platform: "linux",
-        isFile: (path) => path === "/b/dsh-jsonrpc-agent",
+        isFile: (path) => path === "/b/dsh",
       }),
-    ).toBe("/b/dsh-jsonrpc-agent");
-    expect(resolveDshConfig({ CHORUS_DSH_CONFIG: " /a.yml ", DSH_CORDIS_CONFIG: "/b.yml" })).toBe("/a.yml");
-    expect(resolveDshConfig({ DSH_CORDIS_CONFIG: "/b.yml" })).toBe("/b.yml");
+    ).toBe("/b/dsh");
+    // Windows probes the .cmd/.exe shims for `dsh`.
+    expect(
+      resolveDshPath({
+        env: { PATH: "C:\\a;C:\\b" },
+        platform: "win32",
+        isFile: (path) => path === "C:\\b\\dsh.cmd",
+      }),
+    ).toBe("C:\\b\\dsh.cmd");
+    // The explicit managed-home override (replacing the removed cordis config override).
+    expect(resolveDshHome({ CHORUS_DSH_HOME: " /operator/dsh " })).toBe("/operator/dsh");
+    expect(resolveDshHome({})).toBe(null);
   });
 
   it("aggregates valid disjoint categories and never adds reasoning", () => {
@@ -217,15 +228,15 @@ describe("DshSpawner.wake", () => {
       isNew: true,
     });
     expect(onChild).toHaveBeenCalledWith(child);
-    expect(calls.command).toBe("/opt/dsh-jsonrpc-agent");
-    expect(calls.argv).toEqual([]);
+    expect(calls.command).toBe("/opt/dsh");
+    expect(calls.argv).toEqual(["--profile", "sdk"]);
     expect(calls.opts.detached).toBe(true);
     expect(calls.opts.stdio).toEqual(["pipe", "pipe", "pipe"]);
-    expect(calls.opts.env.DSH_CORDIS_CONFIG).toBe("/secure/cordis.yml");
+    expect(calls.opts.env.DSH_HOME).toBe("/managed/home");
+    expect(calls.opts.env.DSH_CORDIS_CONFIG).toBeUndefined();
     expect(calls.opts.env.CHORUS_API_KEY).toBe("cho_secret");
     expect(JSON.stringify(calls.argv)).not.toContain("secret prompt");
     expect(JSON.stringify(calls.argv)).not.toContain("cho_secret");
-    expect(JSON.stringify(calls.argv)).not.toContain("cordis.yml");
 
     const requests = child.stdin.writes.map((line) => JSON.parse(line));
     expect(requests.map((request) => request.method)).toEqual([
@@ -267,6 +278,51 @@ describe("DshSpawner.wake", () => {
     });
   });
 
+  it("passes CJK/space cwd values verbatim while isolating every runtime session", async () => {
+    const fixtures = [
+      { cwd: "/workspaces/项目 alpha", uuid: UUID, sid: SID },
+      { cwd: "/workspaces/space only", uuid: UUID2, sid: SID2 },
+    ];
+    const calls = [];
+    let index = 0;
+    const { spawner } = makeSpawner({
+      uuidFn: () => fixtures[index].uuid,
+      spawnImpl: (command, argv, opts) => {
+        const fixture = fixtures[index++];
+        const child = successfulRuntime(fixture.sid);
+        calls.push({ command, argv, opts, child });
+        return child;
+      },
+    });
+
+    const results = [];
+    for (const fixture of fixtures) {
+      results.push(await spawner.wake({
+        prompt: "continue",
+        sessionId: "shared-claude-anchor",
+        cwd: fixture.cwd,
+        isNew: false,
+      }));
+    }
+
+    expect(spawner.sessionDecision).toEqual({ probeIsAuthoritative: false });
+    expect(results.map((result) => result.backendSessionId)).toEqual([SID, SID2]);
+    for (const [fixtureIndex, fixture] of fixtures.entries()) {
+      const call = calls[fixtureIndex];
+      expect(call.opts.cwd).toBe(fixture.cwd);
+      expect(call.opts.env.DSH_CWD).toBe(fixture.cwd);
+      const requests = call.child.stdin.writes.map((line) => JSON.parse(line));
+      expect(requests[0].params.cwd).toBe(fixture.cwd);
+      expect(requests[1].params.sessionId).toBe(fixture.sid);
+      expect(requests[1].params.sessionId).not.toBe("shared-claude-anchor");
+      expect(results[fixtureIndex]).toMatchObject({
+        sessionId: fixture.sid,
+        backendSessionId: fixture.sid,
+        isNew: true,
+      });
+    }
+  });
+
   it("contains callback exceptions and logs stderr diagnostics", async () => {
     const { spawner, child, logger } = makeSpawner();
     const wake = spawner.wake({
@@ -286,10 +342,10 @@ describe("DshSpawner.wake", () => {
     expect(logger.warn.mock.calls.flat().join("\n")).toMatch(/runtime diagnostic/);
   });
 
-  it("fails visibly when runtime/config are absent", async () => {
+  it("fails visibly when the dsh CLI or managed preparation are absent", async () => {
     const missingRuntime = new DshSpawner({
       resolveDshPathFn: () => null,
-      env: { CHORUS_DSH_CONFIG: "/x" },
+      env: { CHORUS_DSH_HOME: "/x" },
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     });
     await expect(missingRuntime.wake({ prompt: "x", sessionId: "a" })).resolves.toMatchObject({
@@ -297,18 +353,20 @@ describe("DshSpawner.wake", () => {
       isNew: true,
     });
 
+    // dsh present, no CHORUS_DSH_HOME override → managed prep runs; the default
+    // preparer aborts before spawning (no bundle version) and the wake fails loud.
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
-    const missingConfig = new DshSpawner({ dshPath: "/bin/dsh-jsonrpc-agent", env: {}, logger });
-    await expect(missingConfig.wake({ prompt: "x", sessionId: "a" })).resolves.toMatchObject({
+    const missingManaged = new DshSpawner({ dshPath: "/bin/dsh", env: {}, logger });
+    await expect(missingManaged.wake({ prompt: "x", sessionId: "a" })).resolves.toMatchObject({
       exitCode: null,
     });
-    expect(logger.error.mock.calls.flat().join("\n")).toMatch(/managed dsh config/);
+    expect(logger.error.mock.calls.flat().join("\n")).toMatch(/managed dsh profile/);
   });
 
-  it("uses a validated managed config when no explicit override is present", async () => {
+  it("boots a prepared managed DSH_HOME with the external dsh CLI and any provider --patch", async () => {
     const prepareManagedConfigFn = vi.fn(async () => ({
-      configPath: "/managed/cordis.yml",
-      runtimePath: "/managed/node_modules/.bin/dsh-jsonrpc-agent",
+      home: "/managed/home",
+      patchPath: "/managed/home/chorus-provider.patch.yml",
     }));
     const { spawner, calls } = makeSpawner({
       env: { PATH: "/bin" },
@@ -323,12 +381,32 @@ describe("DshSpawner.wake", () => {
     });
     expect(prepareManagedConfigFn).toHaveBeenCalledWith(expect.objectContaining({
       bundleVersion: "0.16.3",
-      dshPath: "/opt/dsh-jsonrpc-agent",
+      dshPath: "/opt/dsh",
       creds: CREDS,
     }));
-    expect(calls.command).toBe("/managed/node_modules/.bin/dsh-jsonrpc-agent");
-    expect(calls.opts.env.DSH_CORDIS_CONFIG).toBe("/managed/cordis.yml");
-    expect(calls.argv).toEqual([]);
+    // The external dsh CLI drives the launch — the managed prep composes only a
+    // profile home, never a runtime bin.
+    expect(calls.command).toBe("/opt/dsh");
+    expect(calls.opts.env.DSH_HOME).toBe("/managed/home");
+    expect(calls.opts.env.DSH_CORDIS_CONFIG).toBeUndefined();
+    expect(calls.argv).toEqual([
+      "--profile",
+      "sdk",
+      "--patch",
+      "/managed/home/chorus-provider.patch.yml",
+    ]);
+  });
+
+  it("omits --patch when the managed prep returns no provider overlay", async () => {
+    const prepareManagedConfigFn = vi.fn(async () => ({ home: "/managed/home", patchPath: null }));
+    const { spawner, calls } = makeSpawner({
+      env: { PATH: "/bin" },
+      bundleVersion: "0.16.3",
+      prepareManagedConfigFn,
+    });
+    await spawner.wake({ prompt: "hi", sessionId: "anchor", cwd: "/workspace", onMessage: vi.fn() });
+    expect(calls.argv).toEqual(["--profile", "sdk"]);
+    expect(calls.opts.env.DSH_HOME).toBe("/managed/home");
   });
 
   it("fails malformed stdout and bounds a runtime that never reaches idle", async () => {

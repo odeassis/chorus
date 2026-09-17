@@ -50,6 +50,7 @@
     "currentAssignee": "当前负责人",
     "failedToAssign": "分配失败",
     "actions": "操作",
+    "close": "关闭",
     "genericError": "发生错误，请重试。",
     "unknown": "未知",
     "system": "系统",
@@ -113,7 +114,17 @@
     "loadError": "加载评论失败",
     "retry": "重试",
     "loadingMore": "加载更多...",
-    "noMoreComments": "没有更多评论"
+    "noMoreComments": "没有更多评论",
+    "actionsLabel": "{name} 的评论操作",
+    "actionsTitle": "评论操作",
+    "actionsDescription": "选择要对 {name} 的评论执行的操作。",
+    "reply": "回复",
+    "replyFailed": "无法准备回复，请重试。",
+    "delete": "删除",
+    "deleteTitle": "删除评论？",
+    "deleteDescription": "此评论将被永久删除，该操作无法撤销。",
+    "deleteConfirm": "删除评论",
+    "deleteFailed": "无法删除评论，请重试。"
   },
   "mentions": {
     "noResults": "无结果",
@@ -1003,6 +1014,7 @@
     "confirmCta": "执行 Yolo",
     "starting": "启动中...",
     "startedHint": "Yolo 已启动 —— agent 正在推进这个 idea 到完成",
+    "completedHint": "该想法已完成",
     "offlineHint": "Agent 离线，重连后可用",
     "errorAgentOffline": "该 agent 当前离线，请等它重新连接后再执行 Yolo。",
     "errorInstanceOffline": "该 idea 已固定到一个离线的 daemon 实例，请等该实例重新连接后再执行 Yolo。",
@@ -1161,31 +1173,39 @@
         "claudeCode": "Claude Code",
         "codex": "Codex",
         "kiro": "Kiro",
+        "pi": "Pi",
         "dsh": "DeepSeek Harness",
         "opencode": "OpenCode",
         "openClaw": "OpenClaw",
         "other": "其他智能体"
       },
+      "profileStep": {
+        "title": "第 3 步（可选）：设置 Chorus CLI 的默认 Agent",
+        "desc": "chorus agents add 会为每个配置的 agent 打印一行 export CHORUS_AGENT_PROFILE。把其中一行加入 shell，即可设置 chorus CLI 默认以哪个 agent 身份运行；密钥会从 ~/.chorus/daemon.json 解析。"
+      },
       "claudeCode": {
         "step1Title": "第 1 步：设置环境变量",
-        "step1Tip": "提示：将这些添加到 ~/.bashrc 或 ~/.zshrc 以实现持久化。",
-        "step2Title": "第 2 步：打开 Claude Code 并运行"
+        "step1Tip": "无需持久化——第 2 步的 chorus agents add 会读取它们。",
+        "step2Title": "第 2 步：运行 chorus agents add",
+        "step2Tip": "chorus agents add 会把 Chorus 插件装进 Claude Code，并把 CHORUS_URL、CHORUS_API_KEY、CHORUS_AGENT_PROFILE 写入 ~/.claude/settings.json——因此交互式 Claude Code 无需手动 export。"
       },
       "codex": {
         "step1Title": "第 1 步：设置环境变量",
-        "step1Tip": "提示：将这些添加到 ~/.bashrc 或 ~/.zshrc 以实现持久化。",
-        "step2Title": "第 2 步：运行 Codex 安装脚本",
-        "step2Tip": "脚本会自动注册 plugin marketplace 并写入 ~/.codex/config.toml 的 MCP 服务器配置。",
-        "step3Title": "第 3 步：验证连接",
-        "step3Desc": "打开 Codex，让它 check in 到 Chorus，例如输入 \"check in to chorus\"。"
+        "step1Tip": "无需持久化——第 2 步的 chorus agents add 会将它们写入 ~/.codex/.env。",
+        "step2Title": "第 2 步：运行 chorus agents add",
+        "step2Tip": "chorus agents add 会安装 Chorus 插件，并将 CHORUS_URL、CHORUS_API_KEY、CHORUS_AGENT_PROFILE 写入 ~/.codex/.env——交互式 Codex 无需手动 export。"
       },
       "kiro": {
         "step1Title": "第 1 步：设置环境变量",
         "step1Tip": "提示：将这些添加到 ~/.bashrc 或 ~/.zshrc，Kiro CLI 会在启动时读取这两个变量。",
-        "step2Title": "第 2 步：运行 Kiro 安装脚本",
-        "step2Tip": "默认全局安装到 ~/.kiro/，Chorus 在任意目录下均可用。若只想安装到当前项目目录下的 .kiro/，请追加参数：bash -s -- --workspace。",
-        "step3Title": "第 3 步：验证连接",
-        "step3Desc": "打开 Kiro CLI 并激活 /chorus-idea 技能，或直接以 Chorus agent 启动：kiro-cli --agent chorus。"
+        "step2Title": "第 2 步：运行 chorus agents add",
+        "step2Tip": "chorus agents add 会把 Chorus 的 skills、agents、steering 以及 chorus MCP 服务器全局安装到 ~/.kiro，使 Chorus 在任意目录下均可用。它会从环境变量（第 1 步）读取 CHORUS_URL 和 CHORUS_API_KEY。若想安装到其他目录，运行前先设置 KIRO_DIR。 上面第一条命令会全局安装 Chorus CLI（锁定 0.17.0 版本）。"
+      },
+      "pi": {
+        "step1Title": "第 1 步：设置环境变量",
+        "step1Tip": "提示：将这些添加到 ~/.bashrc 或 ~/.zshrc，以便 Pi 在运行时读取——chorus agents add 会把一个引用环境变量的 key（而非明文）写入 ~/.pi/agent/mcp.json。",
+        "step2Title": "第 2 步：运行 chorus agents add",
+        "step2Tip": "chorus agents add --agents pi 会安装 pi-mcp-adapter 和 chorus-pi 插件，把 chorus MCP 服务器写入 ~/.pi/agent/mcp.json（引用环境变量中的 CHORUS_API_KEY，不写明文 key），并把 pi 注册为可被唤醒的 daemon agent。它会从环境变量（第 1 步）读取 CHORUS_URL 和 CHORUS_API_KEY。"
       },
       "dsh": {
         "step1Title": "第 1 步：设置环境变量",
@@ -1193,17 +1213,15 @@
         "step2Title": "第 2 步：添加 Chorus bundle",
         "step2Tip": "将 {name} 替换为要使用的 dsh profile。必须带 -w，因为 dsh 的 profile 是一个 pnpm workspace 根。profile 包状态由 dsh 管理，并由 dsh 满足 bundle 的 peer 插件。",
         "step3Title": "第 3 步：写入凭证",
-        "step3Tip": "把 CHORUS_URL 和 CHORUS_API_KEY 写入 $DSH_HOME/.env（权限 0600）。dsh 会把凭据形状的变量从工具子进程里擦掉，所以文档镜像 wrapper 从这个文件读取，而不是从 shell。",
+        "step3Tip": "chorus agents add 会校验你的 key，并把 CHORUS_URL 和 CHORUS_API_KEY 写入 ~/.chorus/daemon.json（权限 0600），如有需要还会把 Chorus bundle 加入该 profile。用 --dsh-profile {name} 指定与第 2 步一致的 profile；它会从环境变量（第 1 步）读取凭证。 上面第一条命令会全局安装 Chorus CLI（锁定 0.17.0 版本）。",
         "step4Title": "第 4 步：启动并验证",
         "step4Desc": "运行 dsh --profile {name}，然后让它执行 \"check in to chorus\"。"
       },
       "opencode": {
         "step1Title": "第 1 步：设置环境变量",
         "step1Tip": "提示：将这些添加到 ~/.bashrc 或 ~/.zshrc，插件会在 OpenCode 启动时读取这两个变量。",
-        "step2Title": "第 2 步：启用 Chorus 插件",
-        "step2Tip": "安装脚本会幂等地把 \"opencode-chorus\" 加入 ~/.config/opencode/opencode.json 的 \"plugin\" 数组，不会修改你的 shell rc。OpenCode 首次启动时 Bun 会自动安装该插件。",
-        "step3Title": "第 3 步：验证连接",
-        "step3Desc": "打开 OpenCode，告诉 agent \"check in to chorus\"。连接成功后本步骤会自动跳转。",
+        "step2Title": "第 2 步：运行 chorus agents add",
+        "step2Tip": "chorus agents add 会幂等地把 \"opencode-chorus\" 加入 ~/.config/opencode/opencode.json 的 \"plugin\" 数组，不会修改你的 shell rc；OpenCode 首次启动时 Bun 会自动安装该插件。它会从环境变量（第 1 步）读取 CHORUS_URL 和 CHORUS_API_KEY。 上面第一条命令会全局安装 Chorus CLI（锁定 0.17.0 版本）。",
         "troubleshootingTitle": "故障排除",
         "issueCache": {
           "title": "插件未加载",
@@ -1223,8 +1241,6 @@
         "step2Title": "第 2 步：编辑 ~/.openclaw/openclaw.json",
         "step3Title": "第 3 步：重启 OpenClaw 网关",
         "step3Desc": "重启 OpenClaw 网关进程以加载新的配置。",
-        "step4Title": "第 4 步：验证连接",
-        "step4Desc": "在 OpenClaw 聊天窗口中，输入以下命令：",
         "troubleshootingTitle": "故障排除",
         "troubleshootingError": "\"Wake agent failed: HTTP 405\"",
         "troubleshootingFix": "此错误表示 hooks 未启用。请在 openclaw.json 配置中将 \"hooks.enabled\" 设置为 true，然后重启网关。"
@@ -1247,6 +1263,18 @@
       "installGuide": "此步骤将引导您完成安装。即将推出。",
       "testConnection": "此步骤将测试智能体连接。即将推出。"
     }
+  },
+  "activeSessions": {
+    "indicatorLabel": "{count} 个 Daemon Session 正在运行——打开或选择会话",
+    "statusOnlyIndicatorLabel": "{count} 个 Daemon Session 正在运行——仅显示状态",
+    "chooserLabel": "正在运行的 Daemon Session",
+    "runningCount": "{count} 个 Session 正在运行",
+    "location": "{host} · {cwd}",
+    "unknownHost": "未知主机",
+    "unknownCwd": "未知工作目录",
+    "agentFallback": "连接详情仍在加载",
+    "statusOnly": "仅显示状态 · 由其他用户拥有",
+    "statusOnlyEntry": "{agent}——仅显示状态"
   },
   "ideaTracker": {
     "overview": "总览",
@@ -1358,6 +1386,17 @@
       "noActivity": "暂无活动"
     },
     "panel": {
+      "actions": {
+        "busy": "请等待当前操作完成",
+        "loadingStage": "正在等待方案和任务数据。如一直未加载，请重新打开想法重试。",
+        "verifyUnavailable": "完成需求澄清后才能确认",
+        "editUnavailable": "已完成澄清的想法无法编辑",
+        "copyLink": "复制链接",
+        "copyUuid": "复制 UUID",
+        "linkCopied": "已复制想法链接",
+        "uuidCopied": "已复制想法 UUID",
+        "copyFailed": "无法复制，请检查剪贴板权限后重试。"
+      },
       "notFound": "未找到想法",
       "loadFailed": "加载想法失败",
       "verifyingPlaceholder": "验证进行中...",
@@ -1502,6 +1541,7 @@
     "clientCodex": "Codex",
     "clientKiro": "Kiro",
     "clientDsh": "DeepSeek Harness",
+    "clientPi": "Pi",
     "clientUnknown": "未知客户端",
     "uptimeMonoDays": "{days}天 {time}",
     "mobileBack": "返回连接列表",
@@ -1533,12 +1573,18 @@
     "entityUnknown": "资源",
     "interrupt": "打断",
     "interrupting": "正在打断…",
+    "clearStuckTurnAria": "清理这个卡住的回合",
     "interruptAria": "打断此正在运行的执行",
     "interruptConfirmTitle": "确定打断此执行？",
     "interruptConfirmBody": "这会停止 daemon 中针对「{title}」正在运行的会话。系统会先请求智能体优雅停止，若未停止则强制结束。之后你可以在本页恢复它。",
     "interruptConfirmAction": "打断",
     "interruptSuccess": "已请求打断「{title}」。",
     "interruptError": "请求打断失败，请重试。",
+    "interruptStuckConfirmTitle": "确定清理这个卡住的回合？",
+    "interruptStuckConfirmBody": "Chorus 仍显示「{title}」有一个正在运行的回合，但 daemon 并未报告任何对应的进程。清理会把该回合标记为已打断，让对话重新可用。不会杀掉任何进程 —— 已经没有进程可杀。之后你可以恢复它。",
+    "interruptStuckConfirmAction": "清理回合",
+    "interruptStuckRequested": "已请求 daemon 停止「{title}」，daemon 响应后该回合会标记为已打断。",
+    "interruptStuckSuccess": "已清理「{title}」卡住的回合。",
     "resume": "恢复",
     "resuming": "正在恢复…",
     "resumeAria": "恢复这个已打断的执行",
@@ -1576,6 +1622,7 @@
     "agentSessionCount": "{count, plural, other {# 个对话}}",
     "listHeader": "对话",
     "loadMore": "加载更多",
+    "loadingMore": "加载中…",
     "loadEarlier": "加载更早的消息",
     "loadingEarlier": "正在加载更早…",
     "transcriptLoading": "正在加载记录…",
@@ -1641,6 +1688,7 @@
     "loadErrorTitle": "无法加载该对话",
     "loadErrorBody": "无法连接到记录服务。这是加载问题，而非空对话。重新打开时会自动重试。",
     "originOfflineNote": "该对话的来源守护进程已离线，因此为只读。历史记录仍会显示；如需发送，请在某个在线目录中继续。",
+    "originOfflineNoteStuckTurn": "该对话的来源守护进程已离线，因此为只读。历史记录仍会显示；如需发送，请在某个在线目录中继续。卡住的回合仍可在此清理。",
     "continueOnlineAction": "在在线目录中继续",
     "continueOnlineHelp": "保留本对话，并在该智能体的某个在线工作目录中继续。它会在该目录中以全新状态接续（上方历史记录将保留为只读上下文）。",
     "continueOnlineStarted": "正在该在线目录中继续",
@@ -1800,5 +1848,8 @@
     "docs": "文档",
     "githubAria": "打开 Chorus GitHub 仓库（在新标签页打开）",
     "docsAria": "打开 Chorus 文档站（在新标签页打开）"
+  },
+  "markdown": {
+    "frontmatterLabel": "文档元信息"
   }
 }

@@ -8,6 +8,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const expectedSkills = [
   "brainstorm-chorus",
   "chorus",
+  "chorus-cli",
   "code-reviewer-chorus",
   "develop-chorus",
   "docs-chorus",
@@ -18,6 +19,7 @@ const expectedSkills = [
   "proposal-reviewer-chorus",
   "quick-dev-chorus",
   "review-chorus",
+  "spec-lite-chorus",
   "task-reviewer-chorus",
   "yolo-chorus",
 ];

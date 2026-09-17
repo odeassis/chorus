@@ -29,6 +29,12 @@ Idea ──> Proposal ──> [Document + Task DAG] ──> Execute ──> Veri
 
 ## 最近更新
 
+**[v0.18.0](https://chorus-ai.dev/zh/blog/chorus-v0.18.0-release/)** — 内置 `spec-lite`，作为 OpenSpec 之外更轻量、可直接进 Git 的本地 Spec 管理方案。live session anchor 让 daemon Agent 的回复回到发起者已有的 Idea 会话。
+
+**[v0.17.2](https://chorus-ai.dev/zh/blog/chorus-v0.17.2-release/)** — Pi 现在可以正式安装并由 daemon 唤醒，`chorus agents run` 还能一条命令切换本地 Agent profile。
+
+**[v0.17.0–0.17.1](https://github.com/Chorus-AIDLC/Chorus/releases/tag/v0.17.1)** — 一个 CLI 即可为各类编程 Agent 安装和更新 Chorus。现在还能在 Tracker、Graph 和 Idea 详情中直接看到 daemon 的实时活动。
+
 **[v0.16.4](https://chorus-ai.dev/zh/blog/chorus-v0.16.4-release/)** — DeepSeek Harness（dsh）成为第六种接入方式：`@chorus-aidlc/chorus-dsh` bundle 把 Chorus 的 skill、persona 和 MCP 配置装进任意 dsh profile。目前仅交互式使用，daemon 唤醒稍后支持。
 
 **[v0.16.1](https://chorus-ai.dev/zh/blog/chorus-v0.16.1-release/)** — 一个 `chorus daemon` 现在可以同时服务多个互相独立的 agent，每个都有自己的密钥、工作目录、后端和权限（通过 `agents[]` 配置）；agent 之间还能通过 @ 把活递给对方，每次唤醒都落在该 agent 自己的项目目录里。
@@ -37,9 +43,7 @@ Idea ──> Proposal ──> [Document + Task DAG] ──> Execute ──> Veri
 
 **[v0.15.0](https://chorus-ai.dev/zh/blog/chorus-v0.15.0-release/)** — 项目级 Agent 工作目录：每位用户可以为项目中的每个 Agent 绑定主机和 cwd，只浏览 daemon 允许的目录，并让任务分配、唤醒、恢复和后续对话使用同一个执行位置，且不迁移进行中的会话。Codex 现在会单独保存可恢复的后端 thread ID，并移除不再需要的 Chorus session 管理步骤。
 
-**[v0.14.1](https://chorus-ai.dev/zh/blog/chorus-v0.14.1-release/)** — Amazon Kiro CLI 成为第四种接入方式（Kiro CLI v2）：一条命令的 `install-kiro.sh` 插件，以及 `--agent kiro` 的 daemon 后端，另有若干 daemon 修复。
-
-**[v0.14.0](https://chorus-ai.dev/zh/blog/chorus-v0.14.0-release/)** — 全应用深色模式（浅色 / 深色 / 跟随系统）。参考资料可挂到任意想法、提案或任务上，行内可读，也能通过 MCP 读写。新增韩语和日语（韩语由社区贡献）。用于归类的**主题**想法，以及 daemon 的「开始开发」/「Yolo」按钮、对话式建想法、崩溃恢复与 `chorus daemon install`。
+**[v0.14.1](https://chorus-ai.dev/zh/blog/chorus-v0.14.1-release/)** — Amazon Kiro CLI 成为第四种接入方式（Kiro CLI v2）：通过 `chorus agents add` 一条命令安装的 Kiro 插件，以及 `--agent kiro` 的 daemon 后端，另有若干 daemon 修复。
 
 > 完整更新日志：[CHANGELOG.md](CHANGELOG.md)
 
@@ -50,7 +54,7 @@ Idea ──> Proposal ──> [Document + Task DAG] ──> Execute ──> Veri
 两条命令即可，无需数据库、无需 Docker、无需配置文件。
 
 ```bash
-npm install -g @chorus-aidlc/chorus
+npm install -g @chorus-aidlc/chorus@0.18.1
 chorus
 ```
 

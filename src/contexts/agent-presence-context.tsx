@@ -1,22 +1,18 @@
 "use client";
 
-// Agent Presence — the single shell-level data spine for the sidebar presence
-// pill, its click popover, and the "View all" modal.
+// Agent Presence — shell-level domain state for the sidebar presence pill, its
+// click popover, and the "View all" modal.
 //
-// WHY a dedicated, shell-mounted provider (not RealtimeContext):
+// WHY a dedicated, shell-mounted domain provider (not RealtimeContext):
 //   The sidebar renders OUTSIDE any `RealtimeProvider` — `RealtimeProvider` is
 //   mounted per-`<main>`, scoped by `projectUuid`, and remounts on navigation;
 //   `/settings` mounts none. So the presence pill (which lives in the always-on
-//   rail) needs its OWN self-contained spine that wraps the whole dashboard shell
-//   and survives route changes. This provider deliberately does NOT depend on or
-//   modify `RealtimeContext`; it opens its own company-wide `/api/events`
-//   EventSource. The two browser EventSource instances are independent — the
-//   server fans out per auth — so a second, shell-level stream coexists with the
-//   page-scoped one (and once the standalone page is removed, net per-tab SSE
-//   count does not increase).
+//   rail) needs state that wraps the whole dashboard shell and survives route
+//   changes. Transport is owned by DashboardEventProvider; AgentPresence and
+//   page Realtime subscribe independently without opening duplicate streams.
 //
-// Data sources (single poll, single SSE — every consumer reads from here, so no
-// duplicate requests across the pill and the modal):
+// Data sources (single poll plus shared SSE subscription — every consumer reads
+// from here, so no duplicate requests across the pill and the modal):
 //   - Connections + online count — polls `GET /api/agent-connections` every 15s,
 //     same cadence/source as the prior page. Online =
 //     `effectiveStatus === "online"`.
@@ -28,8 +24,8 @@
 //     stream opened emits events on a channel this stream isn't subscribed to —
 //     the poll is what surfaces its executions. The poll also recovers from a
 //     silently-dropped SSE message (EventSource has no per-message replay).
-//   - Execution live updates — its own company-wide `EventSource("/api/events")`
-//     (no `projectUuid`) merges `type === "execution"` events by `connectionUuid`
+//   - Execution live updates — the shared company-wide dashboard event stream
+//     merges `type === "execution"` events by `connectionUuid`
 //     into an executions-by-connection map for sub-poll latency. The SSE event
 //     carries the connection's FULL current active set, so a merge replaces that
 //     connection's slice wholesale (no per-row reconcile). Because the poll and
@@ -60,12 +56,20 @@ import {
 } from "react";
 import { authFetch } from "@/lib/auth-client";
 import { clientLogger } from "@/lib/logger-client";
+import {
+  DashboardEventProvider,
+  buildDashboardEventsUrl,
+  useDashboardEvents,
+  useDashboardEventsOptional,
+  STREAM_RESET_EVENT,
+  type DashboardExecutionEvent,
+} from "@/contexts/dashboard-event-context";
 import type {
   ConnectionView,
   ExecutionView,
 } from "@/components/agent-presence";
-import type { ExecutionEvent } from "@/contexts/realtime-context";
 import type {
+  SessionActivityEvent,
   SessionView,
   TranscriptEvent as TranscriptEventBase,
 } from "@/services/daemon-session.service";
@@ -122,6 +126,35 @@ export interface ChatFocusTarget {
 // the modal keeps it). Wholesale-replaced per connection by each SSE event.
 export type ExecutionsByConnection = Record<string, ExecutionView[]>;
 
+interface ActiveSessionAccumulator {
+  sessionUuid: string;
+  ideaUuid: string | null;
+  agentUuid: string;
+  originConnectionUuid: string;
+  activities: ReadonlySet<string>;
+  canOpen: boolean;
+}
+
+export interface SessionActivityState {
+  sessions: ReadonlyMap<string, ActiveSessionAccumulator>;
+  endedActivities: ReadonlySet<string>;
+}
+
+export interface ActiveIdeaSession {
+  sessionUuid: string;
+  ideaUuid: string;
+  agentUuid: string;
+  originConnectionUuid: string;
+  activities: ReadonlySet<string>;
+  agentName: string | null;
+  host: string | null;
+  cwd: string | null;
+  connectionAvailable: boolean;
+  canOpen: boolean;
+}
+
+export type ActiveSessionsByIdea = ReadonlyMap<string, ActiveIdeaSession[]>;
+
 export interface AgentPresenceValue {
   status: AgentPresenceStatus;
   connections: ConnectionView[];
@@ -132,6 +165,7 @@ export interface AgentPresenceValue {
   // the detail pane can show a loading state instead of flashing "Nothing
   // running" in the window where connections have loaded but executions have not.
   executionsLoaded: boolean;
+  activeSessionsByIdea: ActiveSessionsByIdea;
   modalOpen: boolean;
   setModalOpen: (open: boolean) => void;
   // The currently-open conversation (the chat sets this). When it changes, the
@@ -162,6 +196,10 @@ export interface AgentPresenceValue {
     agentUuid: string,
     pin?: { host: string; cwd: string | null },
   ) => void;
+  // Navigate using the same agent+(host,cwd) locator as ProjectCwdSummary.
+  // Activity remains actionable when its connection projection has not arrived:
+  // in that case this deliberately falls back to agent-only focus.
+  openChatForActiveSession: (session: ActiveIdeaSession) => void;
   // Open the daemon-chat modal focused on a SPECIFIC conversation (one-shot, same
   // consume-and-clear contract as `openChatForAgent`). Used after dispatching a new
   // ad-hoc session (e.g. the conversational create-idea entry) to land the user on
@@ -227,6 +265,95 @@ export function mergeExecutionEvent(
   return next;
 }
 
+export function emptySessionActivityState(): SessionActivityState {
+  return {
+    sessions: new Map(),
+    endedActivities: new Set(),
+  };
+}
+
+/**
+ * Token-keyed activity reduction. End tombstones make duplicate and out-of-order
+ * delivery safe: an end observed before a delayed duplicate start cannot
+ * resurrect the activity. A reconnect starts from a fresh state before replay.
+ */
+export function reduceSessionActivity(
+  prev: SessionActivityState,
+  event: SessionActivityEvent,
+): SessionActivityState {
+  if (event.type === "session_ended") {
+    const endedActivities = new Set(prev.endedActivities);
+    endedActivities.add(event.activityUuid);
+    const current = prev.sessions.get(event.sessionUuid);
+    if (!current || !current.activities.has(event.activityUuid)) {
+      return { sessions: prev.sessions, endedActivities };
+    }
+    const activities = new Set(current.activities);
+    activities.delete(event.activityUuid);
+    const sessions = new Map(prev.sessions);
+    if (activities.size === 0) {
+      sessions.delete(event.sessionUuid);
+    } else {
+      sessions.set(event.sessionUuid, { ...current, activities });
+    }
+    return { sessions, endedActivities };
+  }
+
+  if (prev.endedActivities.has(event.activityUuid)) return prev;
+  const current = prev.sessions.get(event.sessionUuid);
+  const activities = new Set(current?.activities ?? []);
+  if (activities.has(event.activityUuid)) return prev;
+  activities.add(event.activityUuid);
+  const sessions = new Map(prev.sessions);
+  sessions.set(event.sessionUuid, {
+    sessionUuid: event.sessionUuid,
+    ideaUuid: event.directIdeaUuid,
+    agentUuid: event.agentUuid,
+    originConnectionUuid: event.originConnectionUuid,
+    activities,
+    canOpen: event.canOpen,
+  });
+  return { sessions, endedActivities: prev.endedActivities };
+}
+
+export function deriveActiveSessionsByIdea(
+  state: SessionActivityState,
+  connections: ConnectionView[],
+): ActiveSessionsByIdea {
+  const connectionsByUuid = new Map(
+    connections.map((connection) => [connection.uuid, connection]),
+  );
+  const grouped = new Map<string, ActiveIdeaSession[]>();
+  for (const session of state.sessions.values()) {
+    if (!session.ideaUuid) continue;
+    const connection = connectionsByUuid.get(session.originConnectionUuid);
+    const item: ActiveIdeaSession = {
+      sessionUuid: session.sessionUuid,
+      ideaUuid: session.ideaUuid,
+      agentUuid: session.agentUuid,
+      originConnectionUuid: session.originConnectionUuid,
+      activities: session.activities,
+      agentName: connection?.agentName ?? null,
+      host: connection?.host ?? null,
+      cwd: connection?.cwd ?? null,
+      connectionAvailable: connection != null,
+      canOpen: session.canOpen,
+    };
+    const sessions = grouped.get(session.ideaUuid) ?? [];
+    sessions.push(item);
+    grouped.set(session.ideaUuid, sessions);
+  }
+  for (const sessions of grouped.values()) {
+    sessions.sort(
+      (a, b) =>
+        a.agentUuid.localeCompare(b.agentUuid) ||
+        a.originConnectionUuid.localeCompare(b.originConnectionUuid) ||
+        a.sessionUuid.localeCompare(b.sessionUuid),
+    );
+  }
+  return grouped;
+}
+
 /**
  * Build the provider's `/api/events` URL for the current open session. With no open
  * session it is the bare company-wide stream (`/api/events`); with one open it carries
@@ -235,10 +362,7 @@ export function mergeExecutionEvent(
  * EventSource. The sessionUuid is URL-encoded defensively even though uuids are
  * already URL-safe. Returns the bare stream for a null/empty session.
  */
-export function buildEventsUrl(openSession: string | null): string {
-  if (!openSession) return "/api/events";
-  return `/api/events?sessionUuid=${encodeURIComponent(openSession)}`;
-}
+export { buildDashboardEventsUrl as buildEventsUrl };
 
 /**
  * Decide whether an arbitrary parsed SSE message is a transcript event for the open
@@ -265,16 +389,36 @@ export function routeTranscriptEvent(
 // ===== Provider =====
 
 export function AgentPresenceProvider({ children }: { children: ReactNode }) {
+  const dashboardEvents = useDashboardEventsOptional();
+  if (!dashboardEvents) {
+    return (
+      <DashboardEventProvider>
+        <AgentPresenceProvider>{children}</AgentPresenceProvider>
+      </DashboardEventProvider>
+    );
+  }
+  return <AgentPresenceProviderInner>{children}</AgentPresenceProviderInner>;
+}
+
+function AgentPresenceProviderInner({ children }: { children: ReactNode }) {
+  const dashboardEvents = useDashboardEvents();
+  const {
+    subscribe: subscribeDashboardEvents,
+    openGeneration,
+    sessionUuid: openSession,
+    setSessionUuid: setOpenSession,
+  } = dashboardEvents;
   const [status, setStatus] = useState<AgentPresenceStatus>("loading");
   const [connections, setConnections] = useState<ConnectionView[]>([]);
   const [executionsByConnection, setExecutionsByConnection] =
     useState<ExecutionsByConnection>({});
   const [executionsLoaded, setExecutionsLoaded] = useState(false);
+  const [sessionActivity, setSessionActivity] =
+    useState<SessionActivityState>(emptySessionActivityState);
   const [modalOpen, setModalOpen] = useState(false);
   // The open conversation. Changing it reconnects the SSE stream with a new
   // `?sessionUuid=` (see the SSE effect). `null` = no conversation open / no transcript
   // channel subscribed.
-  const [openSession, setOpenSession] = useState<string | null>(null);
   // One-shot chat focus target (set by `openChatForAgent`, consumed by `DaemonChat`
   // on modal open). Not a SSE/poll concern — purely UI focus seeding.
   const [focusTarget, setFocusTarget] = useState<ChatFocusTarget | null>(null);
@@ -441,97 +585,67 @@ export function AgentPresenceProvider({ children }: { children: ReactNode }) {
     };
   }, [fetchConnections, fetchExecutions]);
 
-  // SSE spine — one company-wide `/api/events` stream that merges `execution`
-  // events into the map. The aggregate first-paint + periodic re-sync is owned by
-  // the poll loop above; this effect additionally re-pulls the aggregate on a
-  // reconnect so the surface catches up immediately rather than waiting for the
-  // next poll tick. Reconnect on `visibilitychange` whenever the stream is not
-  // OPEN, and close on unmount. Held in a stable effect so the stream is NOT torn
-  // down per navigation (the provider lives at the shell, above route changes).
+  // Consume the shell-owned transport. Subscription changes never replace the
+  // physical EventSource; the DashboardEventProvider owns reconnect/session URL
+  // changes and fans each parsed payload out once.
   useEffect(() => {
-    let es: EventSource | null = null;
-
-    function connect() {
-      disconnect();
-      // No `projectUuid` — this is the company-wide stream that forwards every visible
-      // connection's `execution:{connectionUuid}` events. When a conversation is open it
-      // ALSO carries `?sessionUuid=<uuid>` so the server subscribes that one session's
-      // `transcript:{sessionUuid}` channel; the URL is rebuilt from `openSession` on
-      // every (re)connect so a conversation switch reconnects to the new channel.
-      es = new EventSource(buildEventsUrl(openSession));
-      es.onmessage = (msg) => {
-        let parsed: (Record<string, unknown> & { type?: unknown }) | null = null;
-        try {
-          parsed = JSON.parse(msg.data);
-        } catch {
-          // Non-JSON message (e.g. heartbeat) — ignore.
-          return;
-        }
-        if (!parsed) return;
-        // Transcript events for the open conversation are fanned out to subscribers
-        // (the chat container). The server only subscribes the `?sessionUuid=` it was
-        // asked for, so any transcript event here is for the open session.
-        if (routeTranscriptEvent(parsed, transcriptSubscribersRef.current)) return;
-        // Execution events merge into the by-connection map; everything else (change /
-        // presence) is the page-scoped provider's concern.
-        if (parsed.type === "execution") {
-          const event = parsed as unknown as ExecutionEvent;
-          // Bump this connection's write generation so an aggregate poll that is
-          // in flight knows this slice was freshened and must not be clobbered.
-          connGenRef.current[event.connectionUuid] =
-            (connGenRef.current[event.connectionUuid] ?? 0) + 1;
-          setExecutionsByConnection((prev) => mergeExecutionEvent(prev, event));
-        }
-      };
-      es.onerror = () => {
-        // Browser EventSource auto-reconnects on error; nothing to do here.
-      };
-    }
-
-    function disconnect() {
-      if (es) {
-        es.close();
-        es = null;
+    return subscribeDashboardEvents((parsed) => {
+      if (parsed.type === STREAM_RESET_EVENT) {
+        // Connect-time reset, delivered in-band by the transport on `onopen` and
+        // therefore ordered strictly BEFORE this connection's replayed
+        // `session_started` events. Clearing here — not in the openGeneration
+        // effect below — is what makes reset-before-replay deterministic: a passive
+        // effect could run after the replay had already repopulated the map and
+        // wipe it (the wipe-vs-replay race that made the tracker marker unstable).
+        setSessionActivity(emptySessionActivityState());
+        return;
       }
-    }
-
-    function handleVisibility() {
-      if (document.visibilityState === "visible") {
-        // A live stream is OPEN (readyState 1). A browser auto-reconnect after a
-        // transient error leaves it CONNECTING (0), and an explicit close leaves
-        // it CLOSED (2) — in BOTH cases events may have been missed and the stream
-        // may be stuck, so anything other than OPEN forces a clean reconnect.
-        // (Checking only === CLOSED never fires for the common auto-reconnect.)
-        const streamHealthy = !!es && es.readyState === EventSource.OPEN;
-        if (!streamHealthy) {
-          // Reconnect and re-fetch the aggregate — execution events were missed
-          // while the tab was hidden / the stream was down.
-          connect();
-          fetchExecutions();
-        }
+      if (routeTranscriptEvent(parsed, transcriptSubscribersRef.current)) return;
+      if (parsed.type === "session_started" || parsed.type === "session_ended") {
+        setSessionActivity((prev) =>
+          reduceSessionActivity(prev, parsed as unknown as SessionActivityEvent),
+        );
+        return;
       }
+      if (parsed.type === "execution") {
+        const event = parsed as unknown as DashboardExecutionEvent;
+        connGenRef.current[event.connectionUuid] =
+          (connGenRef.current[event.connectionUuid] ?? 0) + 1;
+        setExecutionsByConnection((prev) => mergeExecutionEvent(prev, event));
+      }
+    });
+  }, [subscribeDashboardEvents]);
+
+  // Executions self-heal on reconnect. The initial open relies on the poll's
+  // first fetch. Every later open denotes a possible delivery gap (native
+  // recovery, explicit visibility recovery, or transcript-session URL
+  // replacement), so re-fetch the executions aggregate to catch up.
+  //
+  // Session-activity is NOT reset here — that reset now rides the in-band
+  // `STREAM_RESET_EVENT` (dispatched by the transport on `onopen`, before this
+  // connection's replay), so it is deterministically ordered before the replay
+  // instead of racing it from a passive effect.
+  const seenOpenGenerationRef = useRef<number | null>(null);
+  useEffect(() => {
+    const generation = openGeneration;
+    if (generation === 0) return;
+    if (seenOpenGenerationRef.current === null) {
+      seenOpenGenerationRef.current = generation;
+      return;
     }
-
-    // First paint: open the stream. The aggregate first fetch is owned by the
-    // poll loop above (mount fetch), so we don't double-fetch it here.
-    connect();
-    document.addEventListener("visibilitychange", handleVisibility);
-
-    return () => {
-      disconnect();
-      document.removeEventListener("visibilitychange", handleVisibility);
-    };
-    // `openSession` is a dep so a conversation switch tears down and reconnects the
-    // stream with the new `?sessionUuid=`. The full effect re-runs, so the
-    // execution-merge `onmessage`, the `visibilitychange` reconnect, and the
-    // on-reconnect aggregate re-fetch are all re-established intact across the switch
-    // (the periodic poll loop is a separate effect and is unaffected). Reconnecting on
-    // switch is deliberate and low-frequency (a user action), as the Tech Design notes.
-  }, [fetchExecutions, openSession]);
+    if (generation > seenOpenGenerationRef.current) {
+      seenOpenGenerationRef.current = generation;
+      void fetchExecutions();
+    }
+  }, [openGeneration, fetchExecutions]);
 
   const onlineCount = useMemo(
     () => computeOnlineCount(connections),
     [connections],
+  );
+  const activeSessionsByIdea = useMemo(
+    () => deriveActiveSessionsByIdea(sessionActivity, connections),
+    [sessionActivity, connections],
   );
 
   // Subscribe to the open conversation's live transcript events. Adds the callback to
@@ -555,6 +669,29 @@ export function AgentPresenceProvider({ children }: { children: ReactNode }) {
       setModalOpen(true);
     },
     [],
+  );
+
+  const openChatForActiveSession = useCallback(
+    (session: ActiveIdeaSession) => {
+      if (!session.canOpen) return;
+      const connection = connections.find(
+        (candidate) => candidate.uuid === session.originConnectionUuid,
+      );
+      // An activity indicator identifies one concrete running conversation, not
+      // merely an agent. Keep the familiar agent+CWD locator for the left rail,
+      // but ALSO carry the session uuid so desktop selects the matching row and
+      // mobile opens its transcript drill-down immediately. Losing sessionUuid
+      // here previously stranded mobile users on the agent's conversation list.
+      setFocusTarget({
+        agentUuid: session.agentUuid,
+        sessionUuid: session.sessionUuid,
+        ...(connection
+          ? { pin: { host: connection.host, cwd: connection.cwd } }
+          : {}),
+      });
+      setModalOpen(true);
+    },
+    [connections],
   );
 
   // Open the chat focused on a specific conversation. Carries the full SessionView
@@ -583,6 +720,7 @@ export function AgentPresenceProvider({ children }: { children: ReactNode }) {
       onlineCount,
       executionsByConnection,
       executionsLoaded,
+      activeSessionsByIdea,
       modalOpen,
       setModalOpen,
       openSession,
@@ -590,6 +728,7 @@ export function AgentPresenceProvider({ children }: { children: ReactNode }) {
       subscribeTranscript,
       focusTarget,
       openChatForAgent,
+      openChatForActiveSession,
       openChatForSession,
       clearChatFocusTarget,
       refreshConnections: fetchConnections,
@@ -600,11 +739,14 @@ export function AgentPresenceProvider({ children }: { children: ReactNode }) {
       onlineCount,
       executionsByConnection,
       executionsLoaded,
+      activeSessionsByIdea,
       modalOpen,
       openSession,
+      setOpenSession,
       subscribeTranscript,
       focusTarget,
       openChatForAgent,
+      openChatForActiveSession,
       openChatForSession,
       clearChatFocusTarget,
       fetchConnections,

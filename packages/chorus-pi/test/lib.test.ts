@@ -3,10 +3,11 @@ import {
   isReviewerAgent,
   isWorkerAgent,
   WORKER_AGENT_NAMES,
-  extractAgentId,
-  extractAgentIdFromToolResultEvent,
+  subagentTaskItems,
   sessionWorkflow,
-  detectOpenSpec,
+  hasSessionMarker,
+  extractRunIdFromToolResultEvent,
+  resolveSpecMode,
   buildSessionBanner,
   parseMaxCodeReviewRounds,
   DEFAULT_MAX_CODE_REVIEW_ROUNDS,
@@ -33,8 +34,9 @@ test("isReviewerAgent: rejects non-reviewers (workers, built-ins, partials)", ()
 });
 
 // ─── isWorkerAgent (positive worker classification for session injection) ──
-test("isWorkerAgent: canonical 'worker' is a worker", () => {
-  expect(isWorkerAgent("worker")).toBe(true);
+test("isWorkerAgent: canonical worker names are workers", () => {
+  expect(isWorkerAgent("worker")).toBe(true);          // pi subagent example back-compat
+  expect(isWorkerAgent("chorus-worker")).toBe(true);   // this package's implementer agent
 });
 
 test("isWorkerAgent: built-in read-only agents are NOT workers", () => {
@@ -58,58 +60,61 @@ test("isWorkerAgent: arbitrary custom agent names are NOT workers (no false posi
 });
 
 test("WORKER_AGENT_NAMES: the canonical allowlist", () => {
-  expect([...WORKER_AGENT_NAMES]).toEqual(["worker"]);
+  expect([...WORKER_AGENT_NAMES]).toEqual(["worker", "chorus-worker"]);
 });
-// ─── extractAgentId ──────────────────────────────────────────────────────────
-test("extractAgentId: reads details.agent.id (the pi-subagents summarizeAgent() path)", () => {
-  const result = {
-    details: { agent: { id: "sa_4d762c7d-213d-4bb3-9fe0-4123bf406c08", agent: "worker", state: "running" } },
-  };
-  expect(extractAgentId(result)).toBe("sa_4d762c7d-213d-4bb3-9fe0-4123bf406c08");
-});
-
-test("extractAgentId: falls back to top-level agentId", () => {
-  expect(extractAgentId({ agentId: "sa_fallback" })).toBe("sa_fallback");
+// ─── subagentTaskItems (ephemeral subagent-model task enumeration) ──────────
+test("subagentTaskItems: single mode yields one holder", () => {
+  const input = { agent: "worker", task: "build the thing" };
+  const items = subagentTaskItems(input);
+  expect(items.map((i) => i.agent)).toEqual(["worker"]);
+  expect(items[0].task).toBe("build the thing");
 });
 
-test("extractAgentId: returns null when neither path present", () => {
-  expect(extractAgentId({ details: { agent: {} } })).toBe(null);
-  expect(extractAgentId({})).toBe(null);
-  expect(extractAgentId(undefined)).toBe(null);
-  expect(extractAgentId(null)).toBe(null);
+test("subagentTaskItems: parallel mode yields one holder per task", () => {
+  const input = { tasks: [{ agent: "worker", task: "a" }, { agent: "scout", task: "b" }] };
+  const items = subagentTaskItems(input);
+  expect(items.map((i) => i.agent)).toEqual(["worker", "scout"]);
+  expect(items.map((i) => i.task)).toEqual(["a", "b"]);
 });
 
-test("extractAgentId: parses sa_<uuid> from result content text when details is absent (the runtime-confirmed shape)", () => {
-  const text = "Spawned worker as sa_4d762c7d-213d-4bb3-9fe0-4123bf406c08. Do useful non-overlapping work immediately.";
-  expect(extractAgentId({ content: [{ type: "text", text }] })).toBe("sa_4d762c7d-213d-4bb3-9fe0-4123bf406c08");
+test("subagentTaskItems: chain mode yields one holder per step", () => {
+  const input = { chain: [{ agent: "planner", task: "plan" }, { agent: "worker", task: "do {previous}" }] };
+  const items = subagentTaskItems(input);
+  expect(items.map((i) => i.agent)).toEqual(["planner", "worker"]);
 });
 
-test("extractAgentId: parses sa_<uuid> even when surrounded by other text (multiline content)", () => {
-  expect(
-    extractAgentId({
-      content: [{ text: "some prefix\n" }, { text: "Spawned scout as sa_0aa265af-1234-5678-9abc-def012345678. done." }],
-    }),
-  ).toBe("sa_0aa265af-1234-5678-9abc-def012345678");
+test("subagentTaskItems: setTask mutates the ORIGINAL input in place (single)", () => {
+  const input: any = { agent: "worker", task: "orig" };
+  subagentTaskItems(input)[0].setTask("orig + injected");
+  expect(input.task).toBe("orig + injected");
 });
 
-test("extractAgentId: returns null when content has no sa_<uuid>", () => {
-  expect(extractAgentId({ content: [{ text: "some other message" }] })).toBe(null);
+test("subagentTaskItems: setTask mutates the ORIGINAL input in place (parallel)", () => {
+  const input: any = { tasks: [{ agent: "worker", task: "t0" }, { agent: "worker", task: "t1" }] };
+  const items = subagentTaskItems(input);
+  items[1].setTask("t1!");
+  expect(input.tasks[1].task).toBe("t1!");
+  expect(input.tasks[0].task).toBe("t0"); // untouched
 });
 
-test("extractAgentId: structured path wins over text fallback", () => {
-  const result = {
-    details: { agent: { id: "sa_structured" } },
-    content: [{ text: "Spawned x as sa_textfallback-0000-…" }],
-  };
-  expect(extractAgentId(result)).toBe("sa_structured");
+test("subagentTaskItems: skips items with a missing/non-string agent or task", () => {
+  expect(subagentTaskItems({ agent: "worker" }).length).toBe(0); // no task
+  expect(subagentTaskItems({ task: "x" }).length).toBe(0); // no agent
+  expect(subagentTaskItems({ agent: 5, task: "x" }).length).toBe(0); // non-string agent
+  expect(subagentTaskItems({ tasks: [{ agent: "worker", task: "ok" }, { agent: "worker" }] }).map((i) => i.task)).toEqual(["ok"]);
 });
-test("extractAgentId: prefers details.agent.id over agentId when both present", () => {
-  expect(
-    extractAgentId({
-      details: { agent: { id: "sa_primary" } },
-      agentId: "sa_secondary",
-    }),
-  ).toBe("sa_primary");
+
+test("subagentTaskItems: non-object / empty input yields no items", () => {
+  expect(subagentTaskItems(undefined)).toEqual([]);
+  expect(subagentTaskItems(null)).toEqual([]);
+  expect(subagentTaskItems("nope")).toEqual([]);
+  expect(subagentTaskItems({})).toEqual([]);
+});
+
+test("subagentTaskItems: tasks[] takes precedence over a stray top-level task", () => {
+  // parallel invocation — the array is the source of truth, not any single-mode fields
+  const items = subagentTaskItems({ tasks: [{ agent: "worker", task: "a" }], agent: "x", task: "y" });
+  expect(items.map((i) => i.agent)).toEqual(["worker"]);
 });
 
 // ─── sessionWorkflow ─────────────────────────────────────────────────────────
@@ -136,8 +141,14 @@ test("sessionWorkflow: starts with a blank line so it separates cleanly from the
   expect(sessionWorkflow("u").startsWith("\n")).toBe(true);
 });
 
-// ─── detectOpenSpec ──────────────────────────────────────────────────────────
-// Helpers to build injectable fs/execSync stubs.
+// ─── resolveSpecMode ─────────────────────────────────────────────────────────
+// The TS reimplementation of the canonical bash resolver
+// (public/chorus-plugin/bin/resolve-spec-mode.sh). This mirrors that resolver's
+// 13-case matrix test (bin/tests/test-spec-mode-resolution.sh) so the TS port
+// stays contract-identical: explicit CHORUS_SPEC_MODE {lite, openspec, off,
+// <invalid>} × OpenSpec {usable, missing-dir, missing-CLI, disabled} + unset.
+// Only mode / chorusOpenspecActive / (specFail?) are asserted (as in the bash
+// matrix); reason strings may differ across ports.
 function fsWith(dirs: string[]): FsLike {
   return { existsSync: (p: string) => dirs.includes(p) };
 }
@@ -151,92 +162,90 @@ function execMissing(): ExecSync {
 }
 
 const CWD = "/proj";
+const USABLE = { fs: fsWith([`${CWD}/openspec`]), exec: execOk() };
+const NO_DIR = { fs: fsWith([]), exec: execOk() };
+const NO_CLI = { fs: fsWith([`${CWD}/openspec`]), exec: execMissing() };
 
-test("detectOpenSpec: optout wins even if dir + CLI present", () => {
-  const r = detectOpenSpec(CWD, true, fsWith([`${CWD}/openspec`]), execOk());
-  expect(r).toEqual({
-    active: false,
-    reason: "CHORUS_OPENSPEC_MODE=off (explicit opt-out)",
-    optout: true,
-    hint: "",
-  });
+// run(label, inputs, fs, exec) → assert {specMode, chorusOpenspecActive, hasFail}
+function rsm(specMode: string | undefined, env: { openspecMode?: string; enableOpenSpec?: string }, io: { fs: FsLike; exec: ExecSync }) {
+  return resolveSpecMode({ specMode, projectRoot: CWD, ...env }, io.fs, io.exec);
+}
+function expectMode(r: ReturnType<typeof resolveSpecMode>, mode: string, active: boolean, hasFail: boolean) {
+  expect(r.specMode).toBe(mode);
+  expect(r.chorusOpenspecActive).toBe(active);
+  expect(r.specFail !== "").toBe(hasFail);
+}
+
+// --- unset ---
+test("resolveSpecMode: unset + usable → openspec", () => {
+  expectMode(rsm(undefined, {}, USABLE), "openspec", true, false);
+});
+test("resolveSpecMode: unset + no openspec dir → lite", () => {
+  expectMode(rsm(undefined, {}, NO_DIR), "lite", false, false);
+});
+test("resolveSpecMode: unset + dir but no CLI → lite", () => {
+  expectMode(rsm(undefined, {}, NO_CLI), "lite", false, false);
+});
+test("resolveSpecMode: unset + disabled(CHORUS_OPENSPEC_MODE=off) → lite", () => {
+  expectMode(rsm(undefined, { openspecMode: "off" }, USABLE), "lite", false, false);
+});
+test("resolveSpecMode: unset + disabled(enableOpenSpec toggle) → lite", () => {
+  expectMode(rsm(undefined, { enableOpenSpec: "false" }, USABLE), "lite", false, false);
 });
 
-test("detectOpenSpec: no openspec/ dir → inactive, not optout", () => {
-  const r = detectOpenSpec(CWD, false, fsWith([]), execOk());
-  expect(r.active).toBe(false);
-  expect(r.optout).toBe(false);
-  expect(r.reason).toContain("no openspec/ directory");
-  expect(r.hint).toBe("");
+// --- explicit lite / off ---
+test("resolveSpecMode: lite + usable → lite (never openspec-active)", () => {
+  expectMode(rsm("lite", {}, USABLE), "lite", false, false);
+});
+test("resolveSpecMode: off + usable → off", () => {
+  expectMode(rsm("off", {}, USABLE), "off", false, false);
 });
 
-test("detectOpenSpec: dir present but CLI missing → inactive with install hint", () => {
-  const r = detectOpenSpec(CWD, false, fsWith([`${CWD}/openspec`]), execMissing());
-  expect(r).toEqual({
-    active: false,
-    reason: "openspec/ directory present but `openspec` CLI not on PATH",
-    optout: false,
-    hint: "install with: npm i -g @fission-ai/openspec",
-  });
+// --- explicit openspec ---
+test("resolveSpecMode: openspec + usable → openspec active", () => {
+  expectMode(rsm("openspec", {}, USABLE), "openspec", true, false);
+});
+test("resolveSpecMode: openspec + no dir → FAIL (halt)", () => {
+  const r = rsm("openspec", {}, NO_DIR);
+  expectMode(r, "openspec", false, true);
+  expect(r.specFail).toContain("not usable");
+});
+test("resolveSpecMode: openspec + no CLI → FAIL (halt)", () => {
+  expectMode(rsm("openspec", {}, NO_CLI), "openspec", false, true);
+});
+test("resolveSpecMode: openspec + disabled → FAIL (config conflict)", () => {
+  const r = rsm("openspec", { openspecMode: "off" }, USABLE);
+  expectMode(r, "openspec", false, true);
+  expect(r.specFail).toContain("config conflict");
 });
 
-test("detectOpenSpec: dir + CLI both present → active", () => {
-  const r = detectOpenSpec(CWD, false, fsWith([`${CWD}/openspec`]), execOk());
-  expect(r).toEqual({
-    active: true,
-    reason: "openspec/ directory + openspec CLI both present",
-    optout: false,
-    hint: "",
-  });
+// --- invalid value falls back to default resolution ---
+test("resolveSpecMode: invalid + usable → openspec (default)", () => {
+  expectMode(rsm("bogus", {}, USABLE), "openspec", true, false);
+});
+test("resolveSpecMode: invalid + no dir → lite (default)", () => {
+  expectMode(rsm("bogus", {}, NO_DIR), "lite", false, false);
 });
 
-test("detectOpenSpec: CLI presence is probed only when the dir exists (optout short-circuits first)", () => {
+// enableOpenSpec toggle is checked before CHORUS_OPENSPEC_MODE (reason order).
+test("resolveSpecMode: enableOpenSpec=false wins the disabled reason over CHORUS_OPENSPEC_MODE=off", () => {
+  const r = rsm(undefined, { enableOpenSpec: "false", openspecMode: "off" }, USABLE);
+  expect(r.specMode).toBe("lite");
+  expect(r.openspecUsableReason).toContain("enableOpenSpec userConfig=false");
+});
+
+// CLI probe is skipped when disabled or dir-missing (short-circuit).
+test("resolveSpecMode: CLI probe skipped when disabled or dir missing", () => {
   let calls = 0;
   const exec = (() => {
     calls++;
   }) as unknown as ExecSync;
-  // optout=true → must NOT touch execSync even if dir missing
-  detectOpenSpec(CWD, true, fsWith([]), exec);
-  expect(calls).toBe(0);
-  // dir missing → must NOT touch execSync either
-  detectOpenSpec(CWD, false, fsWith([]), exec);
-  expect(calls).toBe(0);
-  // dir present → must probe execSync
-  detectOpenSpec(CWD, false, fsWith([`${CWD}/openspec`]), exec);
-  expect(calls).toBe(1);
-});
-
-// ─── extractAgentId: string fallback (path #4) ─────────────────────────────
-test("extractAgentId: parses sa_<uuid> from a plain string result", () => {
-  expect(extractAgentId("Spawned worker as sa_99999999-aaaa-bbbb-cccc-dddddddddddd. Done.")).toBe(
-    "sa_99999999-aaaa-bbbb-cccc-dddddddddddd",
-  );
-});
-
-test("extractAgentId: returns null for a string with no sa_<uuid>", () => {
-  expect(extractAgentId("some text without an agent id")).toBe(null);
-});
-
-// ─── extractAgentIdFromToolResultEvent ──────────────────────────────────────
-test("extractAgentIdFromToolResultEvent: reads details.agent.id directly", () => {
-  expect(
-    extractAgentIdFromToolResultEvent({
-      details: { agent: { id: "sa_aaaa1111-2222-3333-4444-555555555555" } },
-    }),
-  ).toBe("sa_aaaa1111-2222-3333-4444-555555555555");
-});
-
-test("extractAgentIdFromToolResultEvent: falls back to content text", () => {
-  expect(
-    extractAgentIdFromToolResultEvent({
-      content: [{ text: "Spawned x as sa_bbbb2222-3333-4444-5555-666666666666." }],
-    }),
-  ).toBe("sa_bbbb2222-3333-4444-5555-666666666666");
-});
-
-test("extractAgentIdFromToolResultEvent: returns null when neither present", () => {
-  expect(extractAgentIdFromToolResultEvent({})).toBe(null);
-  expect(extractAgentIdFromToolResultEvent({ details: {} })).toBe(null);
+  resolveSpecMode({ projectRoot: CWD, enableOpenSpec: "false" }, fsWith([`${CWD}/openspec`]), exec);
+  expect(calls).toBe(0); // disabled → no probe
+  resolveSpecMode({ projectRoot: CWD }, fsWith([]), exec);
+  expect(calls).toBe(0); // dir missing → no probe
+  resolveSpecMode({ projectRoot: CWD }, fsWith([`${CWD}/openspec`]), exec);
+  expect(calls).toBe(1); // dir present → probe once
 });
 
 // ─── normalizeChorusToolName + resolveChorusToolName ────────────────────────
@@ -252,7 +261,7 @@ test("normalizeChorusToolName: strips one chorus_ server prefix (gateway/direct-
 
 test("normalizeChorusToolName: returns null for non-chorus tools", () => {
   expect(normalizeChorusToolName("bash")).toBe(null);
-  expect(normalizeChorusToolName("subagent_spawn")).toBe(null);
+  expect(normalizeChorusToolName("subagent")).toBe(null);
   expect(normalizeChorusToolName("")).toBe(null);
   expect(normalizeChorusToolName(undefined)).toBe(null);
 });
@@ -281,16 +290,30 @@ test("NUDGE_TOOL_NAMES: the three reviewer-trigger tools", () => {
 });
 
 // ─── buildSessionBanner (user-visible startup banner) ───────────────────────
-// Mirrors the Claude plugin's SessionStart `systemMessage` (#442): a one-line
-// toast with the connection + OpenSpec status.
+// Mirrors the Claude plugin's SessionStart `systemMessage`: a one-line toast
+// with the connection + resolved spec-mode status.
 const URL = "http://localhost:8637";
+
+// Build a SpecModeResult for the banner tests without touching the resolver.
+function spec(overrides: Partial<ReturnType<typeof resolveSpecMode>>): ReturnType<typeof resolveSpecMode> {
+  return {
+    specMode: "off",
+    specReason: "",
+    specFail: "",
+    openspecUsable: false,
+    openspecUsableReason: "",
+    openspecHint: "",
+    chorusOpenspecActive: false,
+    ...overrides,
+  };
+}
 
 test("buildSessionBanner: not configured → warning, no URL surfaced", () => {
   const r = buildSessionBanner({
     configured: false,
     connected: false,
     chorusUrl: "",
-    openspec: { active: false, reason: "not configured", optout: false, hint: "" },
+    spec: spec({}),
   });
   expect(r.level).toBe("warning");
   expect(r.message).toContain("not configured");
@@ -303,67 +326,62 @@ test("buildSessionBanner: connection failed → error with the URL", () => {
     configured: true,
     connected: false,
     chorusUrl: URL,
-    openspec: { active: false, reason: "connection failed", optout: false, hint: "" },
+    spec: spec({}),
   });
   expect(r.level).toBe("error");
   expect(r.message).toContain("connection failed");
   expect(r.message).toContain(URL);
 });
 
-test("buildSessionBanner: connected + OpenSpec active → info, (OpenSpec Enabled)", () => {
+test("buildSessionBanner: connected + openspec → info, (spec: OpenSpec)", () => {
   const r = buildSessionBanner({
     configured: true,
     connected: true,
     chorusUrl: URL,
-    openspec: { active: true, reason: "both present", optout: false, hint: "" },
+    spec: spec({ specMode: "openspec", chorusOpenspecActive: true, openspecUsable: true }),
   });
   expect(r.level).toBe("info");
   expect(r.message).toContain("connected at " + URL);
-  expect(r.message).toContain("(OpenSpec Enabled)");
+  expect(r.message).toContain("(spec: OpenSpec)");
 });
 
-test("buildSessionBanner: connected + explicit opt-out → info, neutral (OpenSpec off), no nag", () => {
+test("buildSessionBanner: connected + lite → info, (spec: spec-lite)", () => {
   const r = buildSessionBanner({
     configured: true,
     connected: true,
     chorusUrl: URL,
-    openspec: { active: false, reason: "CHORUS_OPENSPEC_MODE=off", optout: true, hint: "" },
+    spec: spec({ specMode: "lite" }),
   });
   expect(r.level).toBe("info");
-  expect(r.message).toContain("(OpenSpec off)");
-  // the opt-out case must NOT carry the enable-openspec nudge
+  expect(r.message).toContain("(spec: spec-lite)");
+  // spec-lite is a first-class fallback — it must NOT nag to enable openspec.
   expect(r.message).not.toContain("enable openspec");
 });
 
-test("buildSessionBanner: connected + not set up (no dir) → info, nudge to enable openspec", () => {
+test("buildSessionBanner: connected + off → info, (spec: off — free-form)", () => {
   const r = buildSessionBanner({
     configured: true,
     connected: true,
     chorusUrl: URL,
-    openspec: { active: false, reason: "no openspec/ directory", optout: false, hint: "" },
+    spec: spec({ specMode: "off" }),
   });
   expect(r.level).toBe("info");
-  expect(r.message).toContain("(OpenSpec off");
-  expect(r.message).toContain("/skill:chorus enable openspec");
-  expect(r.message).toContain("to set it up");
+  expect(r.message).toContain("(spec: off");
 });
 
-test("buildSessionBanner: connected + dir present but CLI missing → info, still nudges (not-set-up kind)", () => {
-  // The hint case is still a "not set up" state (optout=false), so the banner
-  // nudges the same way — the richer hint lives in the injected agent context, not the toast.
+test("buildSessionBanner: connected + explicit openspec unusable (specFail) → warning", () => {
   const r = buildSessionBanner({
     configured: true,
     connected: true,
     chorusUrl: URL,
-    openspec: {
-      active: false,
-      reason: "openspec/ directory present but `openspec` CLI not on PATH",
-      optout: false,
-      hint: "install with: npm i -g @fission-ai/openspec",
-    },
+    spec: spec({
+      specMode: "openspec",
+      specFail: "OpenSpec not usable (no openspec/ directory at /proj/openspec)",
+      openspecUsableReason: "no openspec/ directory at /proj/openspec",
+    }),
   });
-  expect(r.level).toBe("info");
-  expect(r.message).toContain("/skill:chorus enable openspec");
+  expect(r.level).toBe("warning");
+  expect(r.message).toContain("unusable");
 });
 
 test("buildSessionBanner: not-configured wins over connection-failed (configured checked first)", () => {
@@ -373,7 +391,7 @@ test("buildSessionBanner: not-configured wins over connection-failed (configured
     configured: false,
     connected: true, // hypothetical: even if we pretend connected
     chorusUrl: "",
-    openspec: { active: false, reason: "x", optout: false, hint: "" },
+    spec: spec({}),
   });
   expect(r.level).toBe("warning");
   expect(r.message).toContain("not configured");
@@ -561,4 +579,30 @@ test("resolveChorusConfigFromMcpJson: all candidates partial → empty (no compl
   const readFile = (p: string) => files[p as keyof typeof files];
   expect(resolveChorusConfigFromMcpJson(["/proj/.mcp.json", "/home/.pi/agent/mcp.json"], fs, readFile))
     .toEqual({ url: "", apiKey: "" });
+});
+
+// ─── hasSessionMarker / extractRunIdFromToolResultEvent ──────────────
+
+test("hasSessionMarker: matches injected block header at line start only", () => {
+  expect(hasSessionMarker("do work\n--- Chorus session (auto-injected by the chorus-pi extension) ---\nSession UUID: x")).toBe(true);
+  expect(hasSessionMarker("--- Chorus session (managed by main agent) ---")).toBe(true);
+  expect(hasSessionMarker("plain implementation task, no chorus")).toBe(false);
+  // prose that merely mentions the phrase must NOT suppress injection
+  expect(hasSessionMarker("this task is about the Chorus session lifecycle")).toBe(false);
+  // a hyphenated continuation is not a header
+  expect(hasSessionMarker("--- Chorus session-notes for the team")).toBe(false);
+  expect(hasSessionMarker("")).toBe(false);
+});
+
+test("extractRunIdFromToolResultEvent: asyncId/runId trusted from details only", () => {
+  expect(extractRunIdFromToolResultEvent({ details: { asyncId: "run-1" } })).toBe("run-1");
+  expect(extractRunIdFromToolResultEvent({ details: { runId: "run-2" } })).toBe("run-2");
+});
+
+test("extractRunIdFromToolResultEvent: generic id/prefix and content are NOT trusted", () => {
+  expect(extractRunIdFromToolResultEvent({ details: { id: "job-1" } })).toBe(null);
+  expect(extractRunIdFromToolResultEvent({ details: { prefix: "abc" } })).toBe(null);
+  // worker output (even JSON) must never misclassify a blocking run as async
+  expect(extractRunIdFromToolResultEvent({ details: {}, content: [{ text: JSON.stringify({ asyncId: "run-x", results: [] }) }] })).toBe(null);
+  expect(extractRunIdFromToolResultEvent({ details: undefined })).toBe(null);
 });

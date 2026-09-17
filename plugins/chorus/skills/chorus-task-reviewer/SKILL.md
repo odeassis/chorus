@@ -1,10 +1,10 @@
 ---
 name: chorus-task-reviewer
-description: 'Read-only Chorus task reviewer. Fetches a task plus its acceptance criteria plus originating proposal documents via MCP, independently verifies the implementation, and posts a structured VERDICT comment. Invoke by mounting this skill into a default sub-agent via spawn_agent(agent_type="default", items=[{ type: "skill", path: "chorus:chorus-task-reviewer", ... }, { type: "text", text: "Review task <uuid>. Max review rounds: 3." }]).'
+description: 'Read-only Chorus task reviewer. Fetches a task plus its acceptance criteria plus originating proposal documents via MCP, independently verifies the implementation, and posts a structured VERDICT comment. Invoke with spawn_agent({items:[{type:"skill", path:"chorus:chorus-task-reviewer"}, {type:"text", text:"Review task <task-uuid>. Max review rounds: 3. Post VERDICT."}]}).'
 license: AGPL-3.0
 metadata:
   author: chorus
-  version: "0.16.4"
+  version: "0.18.1"
   category: project-management
   mcp_server: chorus
   short-description: Adversarial Chorus task reviewer
@@ -98,6 +98,10 @@ For each AC item:
 - Module contracts match what other tasks expect.
 - No silent divergence.
 - **Project constraints**: Read the repo's context files (CLAUDE.md / AGENTS.md / .cursorrules, if present); code that violates a declared project-level rule → BLOCKER.
+
+**Step 5: Intent alignment**
+
+Resolve the originating Idea (this task's proposal → `inputUuids[0]`) and read its body + human-answered elaboration + human-authored comments (`answeredBy.type` / `author.type == "user"`; agent-authored entries are audit context, not intent). Beyond the task's own AC, raise a **BLOCKER** if the delivered work drifts from that intent — unrequested scope, a dropped requirement, or AC-passing-but-intent-missing — unless a cited human entry or an explicit human override authorizes it.
 
 === RECOGNIZE YOUR OWN RATIONALIZATIONS ===
 

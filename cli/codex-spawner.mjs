@@ -14,22 +14,26 @@
 //     `resume <thread_id>`. (serde: ThreadEvent tag="type", rename="thread.started";
 //     ThreadStartedEvent.thread_id: String — codex-rs/exec/src/exec_events.rs.)
 //   • No `--mcp-config`: Codex reads MCP servers from the user's ~/.codex/config.toml.
-//     The Chorus MCP key there is USER-MANAGED: the installer writes a LITERAL Bearer
-//     header and Codex does NOT expand ${VAR} inside http_headers, so the CHORUS_API_KEY
-//     the daemon exports does NOT reach Codex's MCP auth. The daemon still exports
-//     CHORUS_URL / CHORUS_API_KEY into the child env — but only for the plugin's shell
-//     tooling (chorus-api.sh / SessionStart hooks), never argv and never Codex MCP.
-//     (Multi-agent: two Codex agents with different keys each need their own CODEX_HOME.)
+//     `chorus agents add` writes [mcp_servers.chorus] with bearer_token_env_var =
+//     "CHORUS_API_KEY" — a KEYLESS reference (no literal key in config.toml), and Codex
+//     resolves that env var into `Authorization: Bearer <key>` at connect. So the
+//     CHORUS_API_KEY the daemon exports into the child env below DOES reach Codex's MCP
+//     auth (as well as the plugin's shell tooling — chorus-api.sh / SessionStart hooks);
+//     never argv. (Multi-agent: two Codex agents with different keys each need their own
+//     CODEX_HOME so their config.toml + ~/.codex/.env don't collide.)
 //   • Permission is a SANDBOX mode, not a tool allowlist.
 //
 // Reuses claude-spawner's platform-neutral helpers: parseNdjsonChunk (NDJSON
 // stream parse) and the PATH-walk shape of resolveClaudePath.
 
 import { spawn } from "node:child_process";
+import { safeSpawnError } from "./launch-diagnostics.mjs";
+import { validateAgentCliConfig, overlayAgentEnv, getAgentEnv, assertConfiguredShimArgs } from "./agent-cli-config.mjs";
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, win32 as pathWin32, posix as pathPosix } from "node:path";
 import { parseNdjsonChunk } from "./claude-spawner.mjs";
+import { awaitChildSettled } from "./child-exit.mjs";
 import { getThreadId as defaultGetThreadId, setThreadId as defaultSetThreadId } from "./codex-session-map.mjs";
 import {
   getCodexUsageSnapshot as defaultGetUsageSnapshot,
@@ -48,8 +52,9 @@ const NOOP_LOGGER = { info() {}, warn() {}, error() {} };
 export function hasChorusMcpServer(deps = {}) {
   const env = deps.env ?? process.env;
   const readFile = deps.readFile ?? readFileSync;
-  const home = deps.home ?? homedir();
-  const configPath = join(env.CODEX_HOME || join(home, ".codex"), "config.toml");
+  const platform = deps.platform ?? process.platform;
+  const home = deps.home ?? getAgentEnv(env, "HOME", platform) ?? getAgentEnv(env, "USERPROFILE", platform) ?? homedir();
+  const configPath = join(getAgentEnv(env, "CODEX_HOME", platform) || join(home, ".codex"), "config.toml");
   try {
     const config = readFile(configPath, "utf8");
     return /^\s*\[mcp_servers\.chorus\]\s*(?:#.*)?$/m.test(config);
@@ -147,14 +152,15 @@ export function resolveCodexPath(deps = {}) {
       }
     });
 
-  if (env.CHORUS_CODEX_PATH && isFile(env.CHORUS_CODEX_PATH)) {
-    return env.CHORUS_CODEX_PATH;
+  const override = getAgentEnv(env, "CHORUS_CODEX_PATH", platform);
+  if (override && isFile(override)) {
+    return override;
   }
 
   const isWin = platform === "win32";
   const p = isWin ? pathWin32 : pathPosix;
   const names = isWin ? ["codex.cmd", "codex.exe", "codex"] : ["codex"];
-  const pathVar = env.PATH || env.Path || "";
+  const pathVar = getAgentEnv(env, "PATH", platform) || env.Path || "";
   const dirs = pathVar.split(p.delimiter).filter(Boolean);
   for (const dir of dirs) {
     for (const name of names) {
@@ -177,7 +183,7 @@ export function resolveSpawnCommand(codexPath, args, platform = process.platform
   const isWin = platform === "win32";
   const lower = codexPath.toLowerCase();
   if (isWin && (lower.endsWith(".cmd") || lower.endsWith(".bat"))) {
-    const comspec = env.ComSpec || env.COMSPEC || "cmd.exe";
+    const comspec = getAgentEnv(env, "COMSPEC", platform) || "cmd.exe";
     return { command: comspec, argv: ["/d", "/s", "/c", codexPath, ...args] };
   }
   return { command: codexPath, argv: args };
@@ -209,6 +215,8 @@ export class CodexSpawner {
     this.permissionMode = opts.permissionMode ?? "chorus";
     this.creds = opts.creds ?? null;
     this.platform = opts.platform ?? process.platform;
+    this.cliConfig = validateAgentCliConfig(opts.cliConfig, "codex", opts.label);
+    this.env = overlayAgentEnv(opts.env ?? process.env, this.cliConfig.env, this.platform);
     this.getThreadIdFn = opts.getThreadIdFn ?? defaultGetThreadId;
     this.setThreadIdFn = opts.setThreadIdFn ?? defaultSetThreadId;
     this.getUsageSnapshotFn = opts.getUsageSnapshotFn ?? defaultGetUsageSnapshot;
@@ -245,7 +253,7 @@ export class CodexSpawner {
     // instead of publishing the entire historical cumulative total.
     let needsUsageSeed = Boolean(knownThreadId && !previousUsage);
 
-    const codexPath = this.codexPath ?? this.resolveCodexPathFn();
+    const codexPath = this.codexPath ?? this.resolveCodexPathFn({ env: this.env, platform: this.platform });
     if (!codexPath) {
       // No crash — surface visibly and resolve with a failure result.
       this.logger.error("[Chorus] cannot locate the `codex` executable on PATH; skipping wake");
@@ -254,15 +262,17 @@ export class CodexSpawner {
 
     if (!this.mcpConfigChecked) {
       this.mcpConfigChecked = true;
-      if (!this.hasChorusMcpServerFn()) {
+      if (!this.hasChorusMcpServerFn({ env: this.env, platform: this.platform })) {
         this.logger.warn(
           "[Chorus] Codex config has no [mcp_servers.chorus] entry; wake will continue without Chorus MCP tools",
         );
       }
     }
 
-    const args = buildCodexArgs({ isNew, threadId: knownThreadId, permissionMode: this.permissionMode });
-    const { command, argv } = resolveSpawnCommand(codexPath, args, this.platform);
+    assertConfiguredShimArgs(codexPath, this.cliConfig.args, this.platform);
+    const args = [...buildCodexArgs({ isNew, threadId: knownThreadId, permissionMode: this.permissionMode }), ...this.cliConfig.args,
+      ...(this.cliConfig.args.length ? ["-"] : [])];
+    const { command, argv } = resolveSpawnCommand(codexPath, args, this.platform, this.env);
 
     // POSIX: detached process group so the interrupt path can group-kill the tree
     // (codex exec forks child shells for tools). Windows uses taskkill /T. stdio
@@ -272,10 +282,14 @@ export class CodexSpawner {
     // Export the daemon's resolved connection pair for both Codex MCP auth and
     // SessionStart hooks. Explicitly overwrite inherited values so the hook and
     // daemon cannot disagree about which Chorus instance this wake belongs to.
-    const childEnv = { ...process.env, CHORUS_DAEMON_HEADLESS: "1" };
+    const childEnv = { ...this.env, CHORUS_DAEMON_HEADLESS: "1" };
     if (this.creds) {
       if (this.creds.url) childEnv.CHORUS_URL = this.creds.url;
       if (this.creds.apiKey) childEnv.CHORUS_API_KEY = this.creds.apiKey;
+      // Identity profile for the woken session — its hooks/skills pass this to
+      // `chorus mcp --agent`, which resolves the key from ~/.chorus/daemon.json.
+      if (this.creds.agentUuid || this.creds.agentName)
+        childEnv.CHORUS_AGENT_PROFILE = this.creds.agentUuid || this.creds.agentName;
     }
 
     return new Promise((resolve) => {
@@ -289,8 +303,8 @@ export class CodexSpawner {
           detached,
           windowsHide: true,
         });
-      } catch (err) {
-        this.logger.error(`[Chorus] failed to spawn codex: ${err}`);
+      } catch (error) {
+        this.logger.error(`[Chorus] failed to spawn codex: ${safeSpawnError(error)}`);
         resolve({ sessionId: anchor, backendSessionId: knownThreadId, exitCode: null, isNew });
         return;
       }
@@ -352,12 +366,14 @@ export class CodexSpawner {
         if (text) this.logger.warn(`[Chorus] codex stderr: ${text}`);
       });
 
-      child.on("error", (err) => {
-        this.logger.error(`[Chorus] codex process error: ${err}`);
+      child.on("error", (error) => {
+        this.logger.error(`[Chorus] codex process error: ${safeSpawnError(error)}`);
         resolve({ sessionId: anchor, backendSessionId: observedThreadId, exitCode: null, isNew });
       });
 
-      child.on("close", (code) => {
+      // Settle on process exit, not only on stdio close: a detached descendant can
+      // inherit the pipes and keep `close` from ever firing (see cli/child-exit.mjs).
+      awaitChildSettled(child, { logger: this.logger, label: "codex" }).then((code) => {
         if (code !== 0) {
           this.logger.warn(`[Chorus] codex exited with code ${code}`);
         }

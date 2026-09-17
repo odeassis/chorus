@@ -10,6 +10,8 @@ node_modules
 !.yarn/releases
 !.yarn/versions
 package-lock.json
+# OpenClaw is an npm-managed package published via `npm ci`; its lockfile is tracked.
+!packages/openclaw-plugin/package-lock.json
 
 # testing
 /coverage
@@ -57,8 +59,9 @@ default_deploy.sh
 packages/chorus-cdk/lib/*.js
 packages/chorus-cdk/lib/*.d.ts
 
-# Chorus plugin state
-.chorus/
+# Chorus plugin state (ignore runtime state, but keep git-tracked spec-lite specs)
+.chorus/*
+!.chorus/specs/
 
 # Chorus CLI data directory
 .chorus-data/
@@ -68,6 +71,7 @@ packages/chorus-cdk/lib/*.d.ts
 
 # npm pack output
 *.tgz
+/.release-artifacts/
 
 #demo
 dev-story-demo/

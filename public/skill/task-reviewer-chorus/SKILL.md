@@ -4,7 +4,7 @@ description: Read-only adversarial Chorus task reviewer — independently verifi
 license: AGPL-3.0
 metadata:
   author: chorus
-  version: "0.16.4"
+  version: "0.17.0"
   category: project-management
   mcp_server: chorus
 ---
@@ -106,6 +106,10 @@ Do **not** batch AC items as "all look good" — check each one separately. Flag
 Pick 2-3 probes that fit the specific task — boundary values, missing fields, error paths, or concurrency — and **run them**. Do not just describe what you would check.
 
 **Hallucination check:** Flag anything that looks LLM-fabricated as a **NOTE** — API signatures, CLI flags, config keys, model IDs, endpoint URLs, package names, or any external detail the developer likely wrote from memory rather than referencing docs.
+
+### Step 6: Intent Alignment
+
+Resolve the originating Idea (this task's proposal → `inputUuids[0]`) and read its body + human-answered elaboration + human-authored comments (`answeredBy.type` / `author.type == "user"`; agent-authored entries are audit context, not intent). Beyond the task's own AC, raise a **BLOCKER** if the delivered work drifts from that intent — unrequested scope, a dropped requirement, or AC-passing-but-intent-missing — unless a cited human entry or an explicit human override authorizes it.
 
 ---
 

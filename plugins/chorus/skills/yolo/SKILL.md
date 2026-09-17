@@ -4,7 +4,7 @@ description: Full-auto AI-DLC pipeline — from prompt to done. Automates the en
 license: AGPL-3.0
 metadata:
   author: chorus
-  version: "0.16.4"
+  version: "0.18.1"
   category: project-management
   mcp_server: chorus
 ---
@@ -155,7 +155,7 @@ In $yolo mode, the agent generates elaboration questions and answers them itself
            { id: "b", label: "<option B>" }
          ]
        }
-       // ... 5-8 questions covering functional, technical, scope aspects
+       // ... 5-8 questions covering functional, technical_context, scope aspects
      ]
    })
    ```
@@ -184,21 +184,17 @@ In $yolo mode, the agent generates elaboration questions and answers them itself
 
 #### Step 1.4: Create Proposal
 
-1. **Detect OpenSpec mode.** Load the `openspec-aware` skill at `~/.codex/skills/openspec-aware/SKILL.md` and run its §1 detection contract. The result determines how the rest of this step authors documents:
+1. **Read the spec mode (already computed).** The SessionStart hook (`hooks/resolve-spec-mode.sh`) has already resolved it — do NOT re-derive. Read the `## Spec Mode` section: `CHORUS_SPEC_MODE=<lite|openspec|off>` + a routing note. Act on it: `openspec` (usable, shows `CHORUS_OPENSPEC_ACTIVE=1`) → **2a**; `off` → **2b**; `lite` → **2c**. If it says the mode **cannot be honored** (explicit `openspec` but unusable), **halt** and surface it — do NOT fall back or enter 2a with no OpenSpec. (Spawned without context? Source the same helper; `openspec-aware` §1.) This matters because yolo runs unattended.
 
-   - `CHORUS_OPENSPEC_ACTIVE=1` → spec-driven branch (sub-step 2a below).
-   - `CHORUS_OPENSPEC_ACTIVE=0` → free-form branch (sub-step 2b below).
-
-   This is mandatory — yolo runs unattended, so silently picking the wrong mode is exactly the failure scenario the detection contract exists to prevent.
-
-2. **Create the empty proposal container.** In OpenSpec mode, the `description` MUST contain the literal line `OpenSpec change slug: <slug>` (use the `$SLUG` you'll pick in 2a); in free-form mode, omit that line.
+2. **Create the empty proposal container.** The `description` MUST carry the mode's locator line — OpenSpec: `OpenSpec change slug: <slug>`; spec-lite: `Spec-lite: .chorus/specs/<slug>/<YYYY-MM-DD>-<change-slug>/`; free-form: none. `description` is only settable at creation, so decide the slug/dated-path first.
 
    ```
    chorus_pm_create_proposal({
      projectUuid: "<project-uuid>",
      title: "<feature name>",
-     description: "<summary>\n\nOpenSpec change slug: <slug>",   // OpenSpec mode
-     // description: "<summary>",                                 // free-form mode
+     description: "<summary>\n\nOpenSpec change slug: <slug>",                          // OpenSpec (2a)
+     // description: "<summary>\n\nSpec-lite: .chorus/specs/<slug>/<YYYY-MM-DD>-<change-slug>/", // spec-lite (2c)
+     // description: "<summary>",                                                        // free-form (2b)
      inputType: "idea",
      inputUuids: ["<idea-uuid>"]
    })
@@ -209,14 +205,14 @@ In $yolo mode, the agent generates elaboration questions and answers them itself
    **2a. OpenSpec mode (`CHORUS_OPENSPEC_ACTIVE=1`).** Follow `openspec-aware` §3 end-to-end:
    - Pick `$SLUG`, run `openspec new change "$SLUG"` (§3.1–§3.2).
    - Author `proposal.md`, `design.md`, and one `specs/<capability>/spec.md` per capability locally on disk (§3.3). ADDED Requirements only; per-spec fallback to free-form Markdown if MODIFIED/REMOVED is needed.
-   - Define `$API`, `json_encode_file`, `chorus_check_response` helpers (§3.4, §6).
-   - Mirror each local file via `"$API" chorus_pm_add_document_draft "$PAYLOAD"` (§3.6) — one call per file, with the document type from `openspec-aware` §5. (Codex's `chorus-mcp-call.sh` takes `<TOOL_NAME> <JSON>` directly; no `mcp-tool` subcommand.)
+   - Define the `chorus_check_response` helper (§6); prefer `chorus mcp call … --arg-file content=<file>` for mirrors (§3.4/§3.6) — the bash-wrapper fallback's `$API` (§2.1) + `json_encode_file` are only needed when `chorus` is not on `PATH`.
+   - Mirror each local file via `chorus mcp call chorus_pm_add_document_draft … --arg-file content=<file>` (§3.6; fallback = `"$API" chorus_pm_add_document_draft "$PAYLOAD"`) — one call per file, with the document type from `openspec-aware` §5. (Codex's `chorus-mcp-call.sh` takes `<TOOL_NAME> <JSON>` directly; no `mcp-tool` subcommand.)
 
    > **⛔ Do not** invoke `chorus_pm_add_document_draft` / `chorus_pm_update_document_draft` / `chorus_pm_update_document` from Codex's MCP harness with a hand-typed `content` field in this branch. Re-typing the markdown body wastes 20k+ tokens per proposal and breaks byte-equality with the local files. See `openspec-aware` §2 Rule 1.
 
    Then continue to step 3 (task drafts).
 
-   **2b. Free-form mode (`CHORUS_OPENSPEC_ACTIVE=0`).** Add a tech design document draft directly via MCP, content authored inline:
+   **2b. Free-form mode (resolved mode = free-form).** Only when step 1 resolved to free-form — i.e. explicit `CHORUS_SPEC_MODE=off` (unset never comes here: it resolves to OpenSpec when usable, else spec-lite/2c). Add a tech design document draft directly via MCP, content authored inline:
 
    ```
    chorus_pm_add_document_draft({
@@ -226,6 +222,8 @@ In $yolo mode, the agent generates elaboration questions and answers them itself
      content: "<markdown tech design covering architecture, data model, API, module contracts>"
    })
    ```
+
+   **2c. spec-lite mode (resolved mode = lite).** Load the `spec-lite` skill (`~/.codex/skills/spec-lite/SKILL.md`). Pick `$SLUG` (a **capability**). Ensure the durable `.chorus/specs/<slug>/spec.md` exists (local-only, no ids; use the `spec-lite` skill's inline durable-spec template) and update it in place. Create this change's **dated folder** `.chorus/specs/<slug>/<YYYY-MM-DD>-<change-slug>/` with its **synced** Chorus-typed docs (shape = the `spec-lite` skill's inline dated-folder document template) — `prd.md` (primary), optional `tech_design.md`… The `description` carries the `Spec-lite: .chorus/specs/<slug>/<YYYY-MM-DD>-<change-slug>/` locator (step 2). Mirror **each** dated-folder `<type>.md` to its persistent Document byte-exact — first time `chorus mcp call chorus_pm_add_document_draft "{\"proposalUuid\":\"<uuid>\",\"type\":\"prd\",\"title\":\"PRD: <feature>\"}" --arg-file content=.chorus/specs/<slug>/<YYYY-MM-DD>-<change-slug>/prd.md`, later edits via `chorus_pm_update_document` against the recorded `documentUuid` (`chorus-mcp-call.sh` fallback when `chorus` not on `PATH`). **`spec.md` is never mirrored.** No `openspec/changes/` scaffold; no `tasks.md`. Then continue to step 3.
 
 3. **Add task drafts incrementally** (use returned `draftUuid` for dependency chaining). `acceptanceCriteriaItems` is **required** on every draft — at least one non-blank criterion, or the call is rejected:
    ```
@@ -268,19 +266,32 @@ In $yolo mode, the agent generates elaboration questions and answers them itself
 
 ---
 
+### Reviewer contract (applies to every review gate below)
+
+Every gate in Phases 2, 4 and 4.5 follows the same three steps. They are written once here; the phases below only name their entity and their stage-specific actions.
+
+1. **Spawn and wait.** Spawn the reviewer as a read-only sub-agent, then wait for it: spawn it with `spawn_agent`, wait for it with `wait_agent`, then release the thread slot with `close_agent`. The agent's returned text is not the verdict — the verdict is the `VERDICT:` comment it posts.
+2. **Read THIS round's VERDICT.** Call `chorus_get_comments` on the entity and find the `VERDICT:` comment posted **after your dispatch**, not an older round's. Do not advance the gate before you have read it.
+3. **No VERDICT for this round?** Check what the reviewer *did* post:
+   - **A reported round limit, or any other explicit refusal to review** — a deliberate escalation to a human. STOP: do not respawn, do not self-review, do not post a VERDICT of your own.
+   - **Nothing at all** — respawn ONCE, telling it to stay within its turn budget and reserve its last turns for the VERDICT, then apply this same check again to what the retry posts. An explicit refusal from the retry still means STOP; only a second true silence lets you review the entity yourself as a read-only pass and POST the VERDICT, then proceed on what you posted rather than looping forever.
+
+**Absence is never a PASS**, and a round limit reached by someone else is never yours to clear.
+
+---
+
 ### Phase 2: Proposal Review Loop
 
-After `chorus_pm_submit_proposal`, the PostToolUse hook injects context instructing you to spawn the `chorus-proposal-reviewer` sub-agent. The reviewer is a SKILL, not a built-in agent_type — spawn it by mounting the skill into a default agent:
+After `chorus_pm_submit_proposal`, the PostToolUse hook injects context instructing you to spawn the `chorus-proposal-reviewer` sub-agent. Mount the reviewer skill explicitly:
 
 ```
-spawn_agent(
-  agent_type="default",
-  items=[
+reviewer = spawn_agent({
+  items: [
     { type: "skill", name: "Chorus Proposal Reviewer", path: "chorus:chorus-proposal-reviewer" },
     { type: "text",  text: "Review proposal <proposal-uuid>. Max review rounds: 3. Post VERDICT comment." }
   ]
-)
-wait_agent([reviewer_id])
+})
+wait_agent({ targets: [reviewer.agent_id] })
 ```
 
 Then:
@@ -289,9 +300,9 @@ Then:
    ```
    chorus_get_comments({ targetType: "proposal", targetUuid: "<proposal-uuid>" })
    ```
-   Look for the most recent comment containing `VERDICT:`.
+   Look for THIS round's `VERDICT:` comment — the one posted after your dispatch, not an older round's.
 
-   **IMPORTANT — release thread slot**: after `wait_agent` returns, immediately call `close_agent(reviewer_id)`. Codex caps concurrent agent threads at 6; `completed` status does NOT free a slot — only `close_agent` does. On long `$yolo` runs you WILL hit the limit if you don't close each reviewer after use.
+   **IMPORTANT — release thread slot**: after `wait_agent` returns, immediately call `close_agent({ target: reviewer.agent_id })`. Codex caps concurrent agent threads at 6; `completed` status does NOT free a slot — only `close_agent` does. On long `$yolo` runs you WILL hit the limit if you don't close each reviewer after use.
 
 2. **Act on the VERDICT:**
 
@@ -325,7 +336,7 @@ Then:
           Proposal UUID: <uuid>"
    ```
 
-4. **No new VERDICT comment after reviewer returns?** The reviewer exhausted its `maxTurns` budget. Respawn it ONCE with a concise-budget hint: *"Stay within turn budget. Skip deep source verification. Fetch proposal + comments + idea only, skim for obvious BLOCKERs, and post your VERDICT within the first 10 turns."* If the second attempt still produces no VERDICT, treat the proposal as PASS WITH NOTES and proceed — the pipeline cannot loop forever on a silent reviewer.
+4. **No new VERDICT for this round?** Apply step 3 of the **Reviewer contract**, reviewing the proposal yourself if the reviewer stays silent.
 
 ---
 
@@ -351,15 +362,16 @@ loop:
 
   # 2. For each unblocked task, spawn a worker
   for each task in unblocked:
-    spawn_agent(
-      agent_type="worker",
-      message=f"""You are a Chorus developer worker. Follow the $develop skill.
+    spawn_agent({
+      items: [
+        { type: "skill", name: "Chorus Develop", path: "chorus:develop" },
+        { type: "text", text: f"""Implement this Chorus task:
+Task UUID: {task.uuid}
+Project UUID: {project_uuid}
 
-      Your task UUID: {task.uuid}
-      Project UUID: {project_uuid}
-
-      Implement per task description + acceptance criteria. Read task, proposal, and project documents for context. After chorus_submit_for_verify, exit and let the main agent spawn the task-reviewer."""
-    )
+Follow the mounted develop workflow and the task acceptance criteria. Read the task, proposal, and project documents through Chorus. After chorus_submit_for_verify, exit; the main agent owns independent review and admin verification.""" }
+      ]
+    })
 
   # 3. Wait for workers to return (use wait_agent)
   #    Each worker follows $develop skill:
@@ -412,21 +424,19 @@ for each task in wave_tasks:
     continue
 
   # 2. Spawn task-reviewer in FOREGROUND and wait for it (use wait_agent)
-  #    Mount the chorus-task-reviewer SKILL into a default sub-agent
-  #    (Codex only has default/explorer/worker built-in types).
-  spawn_agent(
-    agent_type="default",
-    items=[
+  #    Mount the chorus-task-reviewer SKILL explicitly.
+  reviewer = spawn_agent({
+    items: [
       { type: "skill", name: "Chorus Task Reviewer", path: "chorus:chorus-task-reviewer" },
       { type: "text",  text: "Review Chorus task <task-uuid>. Post VERDICT as a comment before exit." }
     ]
-  )
-  wait_agent([reviewer_id])
-  close_agent(reviewer_id)   # IMPORTANT: release the thread slot (max 6 concurrent, completed != closed)
+  })
+  wait_agent({ targets: [reviewer.agent_id] })
+  close_agent({ target: reviewer.agent_id })   # completed != closed
 
   # 3. Read task-reviewer VERDICT
   comments = chorus_get_comments({ targetType: "task", targetUuid: "<task-uuid>" })
-  # Find the most recent comment containing "VERDICT:"
+  # Find THIS round's "VERDICT:" comment — the one posted after your dispatch, not an older round's
 
   # 4. Act on VERDICT — three possible outcomes:
   if VERDICT is "PASS":
@@ -464,7 +474,7 @@ ESCALATE: "Task '{title}' failed review after {maxRounds} rounds.
 
 Continue with remaining tasks -- do not halt the entire pipeline for one stuck task.
 
-**No new VERDICT comment after the task-reviewer returns?** It exhausted its `maxTurns` budget. Respawn it ONCE with a concise-budget hint: *"Stay within turn budget. Skip deep verification. Fetch task/proposal/comments, run only the core tests, and post your VERDICT within the first 12 turns."* If the second attempt also produces no VERDICT, treat as PASS WITH NOTES and proceed — do not loop indefinitely.
+**No new VERDICT for this round?** Apply step 3 of the **Reviewer contract**, reviewing the task yourself if the reviewer stays silent.
 
 ---
 
@@ -472,15 +482,15 @@ Continue with remaining tasks -- do not halt the entire pipeline for one stuck t
 
 Once **every** task of the idea's proposal is verified (`done`) — Phase 3 finds no more unblocked tasks and none remain non-terminal — run the final ship-time code-review gateway **before** the Phase 5b completion report. It reviews the **whole Idea's aggregate code change** across all tasks (not a single task) and posts its verdict on the **Idea**. After the last task is verified, the PostToolUse hook injects a reminder to spawn it.
 
-The code-reviewer is a SKILL, not a built-in agent_type — mount it into a default sub-agent and wait for it:
+Mount the code-reviewer skill explicitly and wait for it:
 
 ```
-reviewer = spawn_agent(agent_type="default", items=[
+reviewer = spawn_agent({ items: [
     { type: "skill", name: "Chorus Code Reviewer", path: "chorus:chorus-code-reviewer" },
-    { type: "text", text: "Review the aggregate code for idea <idea-uuid>. Round: N." }
-])
-wait_agent([reviewer])
-close_agent(reviewer)   # release the thread slot (Codex caps concurrent agents at 6)
+    { type: "text", text: "Review the aggregate code for idea <idea-uuid>. Round: N. Post VERDICT on the idea." }
+] })
+wait_agent({ targets: [reviewer.agent_id] })
+close_agent({ target: reviewer.agent_id })
 
 # Read the VERDICT on the IDEA
 comments = chorus_get_comments({ targetType: "idea", targetUuid: "<idea-uuid>" })
@@ -496,9 +506,13 @@ ESCALATE: "Idea '{title}' failed code review after {maxCodeReviewRounds} rounds.
            Last BLOCKERs: <list>. Manual intervention needed. Idea UUID: <uuid>"
 ```
 
-**No new VERDICT after the code-reviewer returns?** It exhausted its `maxTurns` budget (larger than the task-reviewer's because it reviews the whole feature). Respawn ONCE with a concise-budget hint; if still silent, treat as PASS WITH NOTES and proceed.
+**No new VERDICT for this round?** Apply step 3 of the **Reviewer contract**, reviewing the idea's aggregate change yourself if the reviewer stays silent.
 
 > The gateway is **behavioral** like the other two reviewers: its verdict is advisory and does not change the Idea's stored status; the orchestrator honors it. It runs **before** the completion report so the report is never written while a FAIL is outstanding.
+
+### Codex sub-agent context and lifecycle
+
+Routine Chorus workers and reviewers start with a fresh context: their mounted skill plus entity UUIDs let them retrieve authoritative state through MCP. Use `fork_context: true` only when a child needs material parent-conversation evidence or decisions that cannot be conveyed cleanly in its assignment, and state why. Call `wait_agent` only when the next pipeline action depends on the result; use `send_input` to redirect an active child, `close_agent` promptly when interaction is finished, and `resume_agent` only for a previously closed child. Codex manages these execution threads; Chorus MCP remains authoritative for claims, statuses, work reports, acceptance evidence, submissions, and verdict comments.
 
 ---
 
@@ -531,7 +545,7 @@ After all waves complete, output a markdown summary:
 
 ### Phase 5b: Idea Completion Report (mandatory)
 
-A successful `$yolo` run always finishes the Idea — call `chorus_create_report` once with `proposalUuid` set to the last verified proposal. The `content` parameter's description carries the section template; follow it. Surface the returned `documentUuid` in the Phase 5 summary. Skipping is a protocol violation.
+A successful `$yolo` run always finishes the Idea — call `chorus_create_report` once with `proposalUuid` set to the last verified proposal. The call requires `title` (a short report title) plus `content`; `content`'s parameter description carries the three-section template (`## Summary` / `## Decisions` / `## Follow-ups`); follow it. Surface the returned `documentUuid` in the Phase 5 summary. Skipping is a protocol violation.
 
 > **Order:** write the completion report only **after** the Phase 4.5 code-review gateway returns PASS / PASS WITH NOTES — never while a code-review FAIL is outstanding.
 

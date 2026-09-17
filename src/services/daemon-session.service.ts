@@ -15,7 +15,8 @@
 // no turn/session business logic lives in routes (service-layer convention).
 //
 // It reuses, never re-models:
-//   - `lineage.service.resolveRootIdea` for `directIdeaUuid` resolution, and
+//   - `lineage.service.resolveDirectIdeaUuid` (re-exported below) for a session's
+//     idea anchor — the shallow, no-ancestry-climb direct-idea primitive, and
 //   - the connection registry's exported `STALE_THRESHOLD_MS` for the single
 //     offline/staleness verdict used by `assertContinuable` (no second constant).
 //
@@ -28,7 +29,9 @@
 import { Prisma } from "@/generated/prisma/client";
 import { prisma } from "@/lib/prisma";
 import { eventBus } from "@/lib/event-bus";
-import { resolveRootIdea, type LineageEntityType } from "@/services/lineage.service";
+// Re-export the canonical DIRECT-idea primitive so the notification chokepoint and the
+// waker-session anchor resolve a session's idea anchor from ONE source (no ancestry climb).
+export { resolveDirectIdeaUuid } from "@/services/lineage.service";
 // The single offline/staleness verdict lives in the connection registry. Import it
 // here (rather than restate the number) so producer (the SSE heartbeat that bumps
 // lastSeenAt) and this consumer can never drift — exactly as the execution service
@@ -66,6 +69,40 @@ export type TurnTrigger = (typeof TURN_TRIGGERS)[number];
 // conversation history — never resumed, never auto-retried.
 export const TURN_STATUSES = ["pending", "running", "ended", "interrupted"] as const;
 export type TurnStatus = (typeof TURN_STATUSES)[number];
+
+// Ephemeral company-stream activity. A running turn is the activity token; no
+// parallel persistence model is needed because reconnect bootstrap reads the
+// authoritative running turns back from DaemonSessionTurn.
+interface SessionActivityEventBase {
+  type: "session_started" | "session_ended";
+  companyUuid: string;
+  sessionUuid: string;
+  activityUuid: string;
+  directIdeaUuid: string | null;
+  agentUuid: string;
+  originConnectionUuid: string;
+}
+
+/** Subscriber-facing activity projection. Authorization is relative to the caller. */
+export interface SessionActivityEvent extends SessionActivityEventBase {
+  canOpen: boolean;
+}
+
+/**
+ * Process-local activity shape. Ownership is used only at the SSE boundary to
+ * derive `canOpen` and is never serialized to subscribers.
+ */
+export interface PublishedSessionActivityEvent extends SessionActivityEventBase {
+  agentOwnerUuid: string | null;
+}
+
+export const SESSION_ACTIVITY_EVENT_NAME = "session_activity";
+
+export function publishSessionActivityEvent(
+  event: PublishedSessionActivityEvent,
+): void {
+  eventBus.emit(SESSION_ACTIVITY_EVENT_NAME, event);
+}
 
 // A SERVER-ONLY terminal turn status (daemon-wake-coalescing). Assigned when a pending
 // turn is COALESCED AWAY — an earlier same-session wake drained it into one batch, so it
@@ -448,23 +485,6 @@ export async function resolveOrCreateSession(params: {
   return toSessionView(row);
 }
 
-/**
- * Resolve the `directIdeaUuid` for an entity via the shared lineage resolver, so the
- * notification chokepoint can derive a session's idea anchor without re-implementing
- * the multi-hop walk. Returns the direct idea uuid (the FIRST idea node on the
- * lineage), or null when the entity has no idea ancestor (a success, not an error —
- * the session is then ad-hoc and keyed on a server-generated uuid by the caller).
- * companyUuid-scoped via the lineage getters; a query failure propagates.
- */
-export async function resolveDirectIdeaUuid(
-  companyUuid: string,
-  entityType: LineageEntityType,
-  entityUuid: string,
-): Promise<string | null> {
-  const result = await resolveRootIdea(companyUuid, entityType, entityUuid);
-  return result.directIdeaUuid;
-}
-
 // ===== Turn lifecycle =====
 
 /**
@@ -783,7 +803,13 @@ export async function advanceTurn(
   // that a future 子3 SSE consumer's multi-tenancy fence could mishandle.
   const session = await prisma.daemonSession.findUnique({
     where: { uuid: turn.sessionUuid },
-    select: { companyUuid: true },
+    select: {
+      companyUuid: true,
+      directIdeaUuid: true,
+      agentUuid: true,
+      originConnectionUuid: true,
+      agent: { select: { ownerUuid: true } },
+    },
   });
   if (!session) {
     throw new Error(
@@ -801,6 +827,16 @@ export async function advanceTurn(
     turn: view,
     // No messages changed on a status transition — empty tail (always-array contract).
     messages: [],
+  });
+  publishSessionActivityEvent({
+    type: status === "running" ? "session_started" : "session_ended",
+    companyUuid: session.companyUuid,
+    sessionUuid: turn.sessionUuid,
+    activityUuid: turnUuid,
+    directIdeaUuid: session.directIdeaUuid,
+    agentUuid: session.agentUuid,
+    originConnectionUuid: session.originConnectionUuid,
+    agentOwnerUuid: session.agent?.ownerUuid ?? null,
   });
   return { ok: true, turn: view };
 }
@@ -1001,6 +1037,160 @@ export async function getVisibleSessions(auth: {
   return rows.map(toSessionView);
 }
 
+// ===== Owner-scoped PAGINATED reads (daemon session list pagination) =====
+//
+// The full-history `getVisibleSessions` above stays as the legacy (no-param) path. The
+// two reads below back the opt-in paginated modes of GET /api/daemon-sessions, so the
+// chat modal never fetches more session rows than it shows. Both keep the exact
+// owner/self + companyUuid fence of `getVisibleSessions`.
+
+// The chat modal's page size — one page of a single agent's conversations. Matches the
+// client's PAGE_SIZE so a first page fills the list exactly once.
+export const DEFAULT_SESSION_PAGE = 12;
+// Hard bound on a caller-supplied `limit`, so a crafted request can't ask for the whole
+// history back (defeating the point) or a pathological page.
+export const MAX_SESSION_PAGE = 100;
+
+function clampSessionLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_SESSION_PAGE;
+  return Math.min(MAX_SESSION_PAGE, Math.max(1, Math.floor(limit)));
+}
+
+/** One entry of the agent index: an agent that has visible session history. */
+export interface AgentSessionIndexEntry {
+  agentUuid: string;
+  // Most recent conversation timestamp for this agent (ISO-8601) — lets the client pick
+  // a default-selected agent without loading any rows.
+  lastTurnAt: string;
+  // How many visible conversations this agent has.
+  sessionCount: number;
+}
+
+/** A page of a single agent's conversations, newest-first, with a keyset cursor. */
+export interface SessionPage {
+  sessions: SessionView[];
+  // Pass as `before` to fetch the next (older) page; null when none remain.
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+/**
+ * The agent axis for the chat modal's Select: every agent that has at least one visible
+ * session, with its most-recent `lastTurnAt` and visible `sessionCount`. A single grouped
+ * aggregate under the SAME owner/self + companyUuid fence as `getVisibleSessions` — NO
+ * per-session origin/naming enrichment and NO orphan-turn reconcile, so its cost scales
+ * with the number of distinct agents, not the total session count. A READ that does NOT
+ * swallow — a query failure propagates.
+ */
+export async function getVisibleAgentIndex(auth: {
+  type: string;
+  companyUuid: string;
+  actorUuid: string;
+}): Promise<AgentSessionIndexEntry[]> {
+  const groups = await prisma.daemonSession.groupBy({
+    by: ["agentUuid"],
+    where: { companyUuid: auth.companyUuid, ...ownerScope(auth) },
+    _count: { _all: true },
+    _max: { lastTurnAt: true },
+    orderBy: { _max: { lastTurnAt: "desc" } },
+  });
+  return groups.map((g) => ({
+    agentUuid: g.agentUuid,
+    // Every grouped agent has ≥1 session, so `_max.lastTurnAt` is always present; guard
+    // defensively rather than assert non-null.
+    lastTurnAt: (g._max.lastTurnAt ?? new Date(0)).toISOString(),
+    sessionCount: g._count._all,
+  }));
+}
+
+/**
+ * One page of a SINGLE agent's visible conversations, newest-first, keyset-paginated by
+ * a stable `(lastTurnAt desc, uuid desc)` order (mirrors `comment.service` cursor paging:
+ * `cursor` + `skip: 1` + `take: limit + 1` for the `hasMore` sentinel, no count query).
+ *
+ * Visibility: an AGENT key may only page ITS OWN sessions — a mismatch yields an empty
+ * page (non-disclosure), never another agent's rows. This explicit guard matters because
+ * for an agent caller `ownerScope` is the scalar `{ agentUuid: actorUuid }`, which the
+ * requested `agentUuid` would otherwise overwrite when merged into the same `where`
+ * object; the guard makes the merge safe (they are equal past this point). A USER /
+ * super_admin caller's `ownerScope` is the relation filter `{ agent: { ownerUuid } }` (a
+ * distinct key), so it AND-composes with `agentUuid` and never cross-owner leaks. A READ
+ * that does NOT swallow.
+ */
+export async function getSessionsPageForAgent(
+  auth: { type: string; companyUuid: string; actorUuid: string },
+  agentUuid: string,
+  opts?: { limit?: number; before?: string | null },
+): Promise<SessionPage> {
+  if (auth.type === "agent" && agentUuid !== auth.actorUuid) {
+    return { sessions: [], nextCursor: null, hasMore: false };
+  }
+  const limit = clampSessionLimit(opts?.limit);
+  const before = opts?.before ?? null;
+  const rows = await prisma.daemonSession.findMany({
+    where: { companyUuid: auth.companyUuid, ...ownerScope(auth), agentUuid },
+    orderBy: [{ lastTurnAt: "desc" }, { uuid: "desc" }],
+    ...(before ? { cursor: { uuid: before }, skip: 1 } : {}),
+    take: limit + 1,
+  });
+  const hasMore = rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  const nextCursor = hasMore ? pageRows[pageRows.length - 1].uuid : null;
+  // Reconcile only the PAGE's origin connections — bounded, not the full history.
+  await reconcileOrphanTurnsForSessions(auth.companyUuid, pageRows);
+  return { sessions: pageRows.map(toSessionView), nextCursor, hasMore };
+}
+
+/**
+ * Rebuild the caller-visible running activity set for company-stream bootstrap.
+ * User subscribers observe every running session in their company and receive
+ * subscriber-relative `canOpen`; agent keys remain self-only. The projection
+ * comes directly from running turns, with no polling endpoint or persisted flag.
+ */
+export async function listVisibleRunningSessionActivities(auth: {
+  type: string;
+  companyUuid: string;
+  actorUuid: string;
+}): Promise<SessionActivityEvent[]> {
+  const rows = await prisma.daemonSessionTurn.findMany({
+    where: {
+      status: "running",
+      session: {
+        companyUuid: auth.companyUuid,
+        ...(auth.type === "agent" ? { agentUuid: auth.actorUuid } : {}),
+      },
+    },
+    orderBy: [{ sessionUuid: "asc" }, { uuid: "asc" }],
+    select: {
+      uuid: true,
+      sessionUuid: true,
+      session: {
+        select: {
+          companyUuid: true,
+          directIdeaUuid: true,
+          agentUuid: true,
+          originConnectionUuid: true,
+          agent: { select: { ownerUuid: true } },
+        },
+      },
+    },
+  });
+
+  return rows.map((row) => ({
+    type: "session_started",
+    companyUuid: row.session.companyUuid,
+    sessionUuid: row.sessionUuid,
+    activityUuid: row.uuid,
+    directIdeaUuid: row.session.directIdeaUuid,
+    agentUuid: row.session.agentUuid,
+    originConnectionUuid: row.session.originConnectionUuid,
+    canOpen:
+      auth.type === "agent"
+        ? row.session.agentUuid === auth.actorUuid
+        : row.session.agent.ownerUuid === auth.actorUuid,
+  }));
+}
+
 /**
  * List the turns of a single session, ordered by `seq`, applying the SAME owner/self
  * + companyUuid visibility fence as `getVisibleSessions`. The session is first
@@ -1182,21 +1372,17 @@ export async function getSessionDetail(
       ? opts.beforeMsgSeq
       : null;
 
-  // Candidate turn window: every turn at or before the cursor turn (`seq <= beforeTurnSeq`),
-  // or all turns when no cursor. NOTE: only messages are trimmed by the rolling-window cap
-  // (`trimSessionTranscript` deletes DaemonTranscriptMessage rows) — turns are NOT, so this
-  // set grows with the session's wake count (one turn per wake). For the conversational
-  // session sizes this read serves that is acceptable: we load these turns' messages in one
-  // batched query and slice the composite window in memory (D4), bounded per page by `limit`.
-  // If a session's turn count ever grows large enough to matter, bound this with a `take`
-  // heuristic (limit + margin, widen on underflow) rather than scanning all turns.
-  // Ordered seq DESC so the slot/message stream is newest-first before windowing.
+  // Candidate turn window: every turn contributes a msgSeq=0 stream slot, so `limit + 1`
+  // turns cover the returned page plus the hasMore sentinel. A cursor at msgSeq=0 excludes
+  // its equal-seq turn; one extra turn covers that edge. Thus `limit + 2` is a fixed safe
+  // bound independent of total session history. Ordered seq DESC before stream folding.
   const candidateTurns = await prisma.daemonSessionTurn.findMany({
     where: {
       sessionUuid,
       ...(beforeTurnSeq !== null ? { seq: { lte: beforeTurnSeq } } : {}),
     },
     orderBy: { seq: "desc" },
+    take: limit + 2,
   });
 
   // Load the candidate turns' real messages in ONE batched query, then fold in memory —
@@ -1729,6 +1915,59 @@ export type AdvanceTurnForWakeResult =
  * → interrupted edge). A query/write failure propagates (no swallow): a lost
  * transition would strand a turn's lifecycle.
  */
+/**
+ * Resolve the session business key a CONTROL command should settle, for the one caller
+ * that has an entity key rather than a session id (`POST /api/daemon/control`).
+ *
+ * `sessionId === entityUuid` is an identity for a modern idea-anchored session and for an
+ * ad-hoc `daemon_session`, but NOT for a LEGACY residual session, whose business key is
+ * `${ideaUuid}::${connectionUuid}` (fix-daemon-conversation-split-cwd-agent). The client
+ * derives `idea:<ideaUuid>` for both shapes — it healed the `::` away — so settling
+ * `sessionId = entityUuid` blindly can address a DIFFERENT, modern session that merely
+ * shares the idea uuid: it would clear an unrelated turn and leave the legacy one running.
+ *
+ * Candidates are therefore the exact-key session plus any legacy `${entityUuid}::…`
+ * session ORIGINATING on the targeted connection, and the winner is decided by evidence:
+ * the candidate that actually holds a `running` turn. Zero candidates with a running turn
+ * → null (nothing to settle). More than one → null: the command is ambiguous and guessing
+ * would write to the wrong conversation. Both cases are the caller's no-op.
+ *
+ * Read-only. Returns the session's `sessionId`, never a uuid.
+ */
+export async function resolveControlSessionId(params: {
+  companyUuid: string;
+  agentUuid: string;
+  connectionUuid: string;
+  entityUuid: string;
+}): Promise<{ sessionId: string | null; ambiguous: boolean }> {
+  const candidates = await prisma.daemonSession.findMany({
+    where: {
+      companyUuid: params.companyUuid,
+      agentUuid: params.agentUuid,
+      OR: [
+        { sessionId: params.entityUuid },
+        {
+          sessionId: { startsWith: `${params.entityUuid}::` },
+          originConnectionUuid: params.connectionUuid,
+        },
+      ],
+    },
+    select: { uuid: true, sessionId: true },
+  });
+  if (candidates.length === 0) return { sessionId: null, ambiguous: false };
+  if (candidates.length === 1) return { sessionId: candidates[0].sessionId, ambiguous: false };
+
+  const running = await prisma.daemonSessionTurn.findMany({
+    where: { sessionUuid: { in: candidates.map((c) => c.uuid) }, status: "running" },
+    select: { sessionUuid: true },
+    distinct: ["sessionUuid"],
+  });
+  if (running.length === 0) return { sessionId: null, ambiguous: false };
+  if (running.length > 1) return { sessionId: null, ambiguous: true };
+  const winner = candidates.find((c) => c.uuid === running[0].sessionUuid);
+  return { sessionId: winner?.sessionId ?? null, ambiguous: false };
+}
+
 export async function advanceTurnForWake(params: {
   companyUuid: string;
   agentUuid: string;

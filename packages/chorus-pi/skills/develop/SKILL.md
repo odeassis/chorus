@@ -4,7 +4,7 @@ description: Chorus Development workflow — claim tasks, report work, manage se
 license: AGPL-3.0
 metadata:
   author: chorus
-  version: "0.16.4"
+  version: "0.18.1"
   category: project-management
   mcp_server: chorus
 ---
@@ -78,7 +78,7 @@ Review your persona, current assignments, and pending work counts.
 
 **Skip if you are the main agent or Team Lead.**
 
-If you are a **sub-agent** (spawned via `subagent_spawn`), the Chorus extension automatically creates your session and injects it into your task prompt — look for a `--- Chorus session (auto-injected) ---` section containing your `Session UUID`. Keep it for all task operations.
+If you are a **sub-agent** (dispatched via the `subagent` tool), the Chorus extension automatically creates your session and injects it into your task prompt — look for a `--- Chorus session (auto-injected) ---` section containing your `Session UUID`. Keep it for all task operations.
 
 ### Step 2: Find Work
 
@@ -134,13 +134,15 @@ Each task and proposal includes a `commentCount` field — use it to decide whic
    chorus_get_documents({ projectUuid: "<project-uuid>" })
    ```
 
-> **Document update flow (OpenSpec mode):** if the originating proposal `description` contains a line `OpenSpec change slug: <slug>`, the project's PRD / tech_design / spec Documents are **mirrors** of files under `openspec/changes/<slug>/`. To update such a Document (e.g. clarify an AC, fix a spec scenario before resubmitting), load the `openspec-aware` skill at `skills/openspec-aware/SKILL.md` and follow §3.8: edit the local `.md` file first, then mirror through the `chorus-mcp-call.sh` wrapper with `json_encode_file` and `chorus_check_response`.
+> **Document update flow (OpenSpec mode):** if the originating proposal `description` contains a line `OpenSpec change slug: <slug>`, the project's PRD / tech_design / spec Documents are **mirrors** of files under `openspec/changes/<slug>/`. To update such a Document (e.g. clarify an AC, fix a spec scenario before resubmitting), load the `openspec-aware` skill at `skills/openspec-aware/SKILL.md` and follow §3.8: edit the local `.md` file first, then mirror it — prefer `chorus mcp call … --arg-file content=<file>`, falling back to the `chorus-mcp-call.sh` wrapper with `json_encode_file` when `chorus` is not on `PATH` — with `chorus_check_response` halting on error.
 >
 > **⛔ Do not** call `chorus_pm_update_document` directly from the MCP harness with a hand-typed `content` field in OpenSpec mode. The local file is the source of truth; agent-typed content drifts and burns tokens (`openspec-aware` §2 Rule 1).
 >
 > When the LAST task of an OpenSpec idea is verified, the extension injects an archive reminder (`openspec-aware` §3.9) — run `openspec archive <slug> --yes`, then mirror each emitted `openspec/specs/<capability>/spec.md` back via §3.8.
 >
-> In the no-OpenSpec fallback (no slug line, or no `openspec` CLI), edit the Document content directly via the existing MCP tool with no wrapper, no local file step.
+> **Document update flow (spec-lite mode):** if the proposal `description` contains a line `Spec-lite: .chorus/specs/<slug>/<YYYY-MM-DD>-<change-slug>/`, the project's PRD / tech_design / … Documents are **mirrors** of the files in that dated folder. To update such a Document, load the `spec-lite` skill (`/skill:spec-lite`) and follow its Mirror section: edit the local `<type>.md` file first, then mirror it via `chorus mcp call chorus_pm_update_document "{\"documentUuid\":\"<uuid>\"}" --arg-file content=<file>` (recorded `documentUuid` from the file's frontmatter), falling back to the `chorus-mcp-call.sh` wrapper when `chorus` is not on `PATH`, `chorus_check_response` halting on error. Same **⛔ do-not-hand-type-`content`** rule as OpenSpec. The durable `.chorus/specs/<slug>/spec.md` is edited in place too but is **never mirrored** (git history is its record). No archive flow — spec-lite has no CLI/validate/archive; on delivery just set `spec.md` `status: done`.
+>
+> In the no-OpenSpec, no-spec-lite fallback (free-form: no locator line), edit the Document content directly via the existing MCP tool with no wrapper, no local file step.
 
 ### Step 5: Start Working
 
@@ -229,13 +231,13 @@ After the reviewer completes, read its VERDICT:
 ```
 chorus_get_comments({ targetType: "task", targetUuid: "<task-uuid>" })
 ```
-Find the most recent comment containing `VERDICT:` and act on it:
+Find THIS round's `VERDICT:` comment — the one posted after your dispatch, not an older round's — and act on it:
 
 - **VERDICT: PASS** — All AC verified, no issues. Proceed to admin verification.
 - **VERDICT: PASS WITH NOTES** — All AC verified, minor notes. Proceed to admin verification (notes are non-blocking).
 - **VERDICT: FAIL** — BLOCKERs found. Do NOT verify. Fix the BLOCKERs listed in the reviewer's comment, then resubmit.
 
-If no new `VERDICT:` comment appears after the reviewer returns, it exhausted its turn budget before posting. Respawn it ONCE with a concise-budget hint in the prompt: *"Stay within turn budget. Skip deep verification. Fetch task/proposal/comments, run only the core tests, and post your VERDICT comment within the first 12 turns."* If the second attempt still produces no VERDICT, review manually using the checklist and proceed.
+If no new `VERDICT:` comment appears after the reviewer returns, check what it *did* post. A comment reporting that the round limit was reached, or any other explicit refusal to review, is a deliberate escalation to a human: STOP — do not respawn, do not self-review, do not post a VERDICT of your own. If it posted nothing at all, respawn it ONCE, telling it to stay within its turn budget and reserve its last turns for the VERDICT, then apply this same check again to what the retry posts. An explicit refusal from the retry still means STOP; only a second true silence lets you review the task yourself as a read-only pass using the checklist and POST the VERDICT comment. **Absence is never a PASS.**
 
 > **Final code-review gateway (after the Idea's LAST task is verified):** when the task you just verified is the **last** task of its idea-rooted proposal, the feature is about to ship — the extension nudges you to spawn `chorus-code-reviewer` (gated by `CHORUS_ENABLE_CODE_REVIEWER`, default on). Spawn it yourself via the blocking `subagent` tool, passing the `ideaUuid` + round number; it reviews the Idea's **aggregate** code change across all its tasks (cross-task integration, architecture, security, regression, feature-level coverage) and posts one `VERDICT` comment on the **idea**. `PASS` / `PASS WITH NOTES` → ship; `FAIL` → fix via `/skill:quick-dev` (`chorus_create_tasks` with `proposalUuid` set to the current approved proposal so the fix tasks attach to it — do NOT reopen the verified tasks). Group related small BLOCKERs by default; split only materially large or independently testable fixes. Require AC self-check, independent task review, and admin verification for every fix task. Re-run aggregate review only after every fix is successfully `done`; a failed or cancelled fix stops the loop and escalates, bounded by `CHORUS_MAX_CODE_REVIEW_ROUNDS` (env, default 3; 0 = unlimited). Advisory/behavioral, like the other reviewers. Run it **before** any idea-completion report.
 
@@ -259,13 +261,13 @@ Once Admin verifies (status: `done`), move to the next available task (back to S
 
 ### Step 11: Idea Completion Report (advisory)
 
-If the task you just self-verified was the LAST one of its Idea (every Task across every approved Proposal is now `done`/`closed`) and you have `document:write`, offer to call `chorus_create_report` via `AskUserQuestion`. The `content` parameter's description carries the section template. Skip on decline — the extension will remind on the next run.
+If the task you just self-verified was the LAST one of its Idea (every Task across every approved Proposal is now `done`/`closed`) and you have `document:write`, offer to call `chorus_create_report` via `AskUserQuestion`. The call requires `title` (a short report title) plus `content`; `content`'s parameter description carries the three-section template (`## Summary` / `## Decisions` / `## Follow-ups`). Skip on decline — the extension will remind on the next run.
 
 ---
 
 ## Session (Sub-Agents Only)
 
-The Chorus extension **fully automates** session lifecycle — creation (on `subagent_spawn`, via `tool_call` task injection) and cleanup (on `subagent_manage close`) are handled by the extension. Sub-agents only do 3 things manually:
+The Chorus extension **fully automates** session lifecycle — a Chorus session is created (on `subagent` dispatch, via `tool_call` task injection) and closed (when the blocking `subagent` call returns) by the extension. Sub-agents only do 3 things manually:
 
 1. `chorus_session_checkin_task({ sessionUuid, taskUuid })` — before starting work
 2. `chorus_session_checkout_task({ sessionUuid, taskUuid })` — when done (recommended; plugin also auto-checkouts on exit)
@@ -277,13 +279,15 @@ The Chorus extension **fully automates** session lifecycle — creation (on `sub
 
 ## Parallel Sub-Agent Integration
 
-When using Pi's subagents (`pi-subagents`) to run multiple sub-agents in parallel, Chorus provides full work observability. The `chorus-pi` extension automates the session lifecycle: when you `subagent_spawn` a worker, it creates a Chorus session and injects the session UUID + workflow into the worker's task; when you `subagent_manage close` the agent, it closes the session.
+Use the `subagent` tool to run multiple Chorus workers in parallel; Chorus provides full work observability. The `subagent` tool is **blocking** — a parallel dispatch runs every worker to completion and returns their aggregated output in one call (there is no async spawn, no `agentId`, and no manual close). The `chorus-pi` extension automates session lifecycle: when you dispatch a `chorus-worker`, it creates a Chorus session and injects the session UUID + workflow into that worker's task; when the `subagent` call returns, it closes the session.
+
+> The `subagent` tool has three modes — **single** (`{ agent, task }`), **parallel** (`{ tasks: [...] }`, max 8 per call, concurrency 4), and **chain** (`{ chain: [...] }`, sequential with a `{previous}` placeholder). Dispatch `agent: "chorus-worker"` for Chorus task implementation.
 
 ### Two-Layer Architecture
 
 | Layer | System | Purpose |
 |-------|--------|---------|
-| **Orchestration** | Pi subagents (`subagent_spawn` / `subagent_send` / `subagent_mailbox`) | Spawning sub-agents, follow-up tasks, inter-agent messaging |
+| **Orchestration** | The `subagent` tool (single / parallel / chain) | Dispatching workers to isolated pi subprocesses and collecting their results |
 | **Work Tracking** | Chorus | Task lifecycle, session observability, activity stream |
 
 ### Team Lead Workflow
@@ -293,24 +297,28 @@ When using Pi's subagents (`pi-subagents`) to run multiple sub-agents in paralle
 chorus_checkin()
 chorus_list_tasks({ projectUuid: "<project-uuid>" })
 
-# 2. Spawn sub-agents (async — returns immediately with an agentId)
-# Pass only task UUIDs — the chorus-pi extension auto-injects the session
-# UUID + workflow into the worker's task.
-subagent_spawn({
-  agent: "worker",
-  task: "Your Chorus task UUID: <task-uuid>\nProject UUID: <project-uuid>\n\nImplement..."
+# 2. Dispatch a worker per ready task in ONE blocking parallel call (max 8).
+# Pass only task + project UUIDs — the chorus-pi extension auto-injects the
+# session UUID + workflow into each worker's task.
+subagent({
+  tasks: [
+    { agent: "chorus-worker",
+      task: "Your Chorus task UUID: <task-uuid>\nProject UUID: <project-uuid>\n\nImplement..." },
+    // ... one entry per ready task, max 8 (batch into multiple calls if more)
+  ]
 })
-# → returns agentId (sa_<uuid>); keep it to close the agent later.
+# The call BLOCKS until every worker finishes and returns their outputs.
+# For a single task, use single mode: subagent({ agent: "chorus-worker", task: "..." })
 ```
 
 **What the Team Lead prompt needs:**
-- Task UUID(s)
+- Task UUID(s) + Project UUID
 - NO session UUID, NO workflow boilerplate — the extension auto-injects everything
-- The `agentId` returned by `subagent_spawn` (needed to `subagent_manage close` later)
+- No `agentId` to track and no close step — the blocking call owns the worker's whole lifecycle
 
 ### Sub-Agent Workflow
 
-The extension injects the session UUID + workflow into the sub-agent's task automatically (at `tool_call` time, before the subprocess starts). The sub-agent reads the `Session UUID:` from its task prompt and follows the injected steps:
+The extension injects the session UUID + workflow into the worker's task automatically (at `tool_call` time, before the subprocess starts). The worker reads the `Session UUID:` from its task prompt and follows the injected steps:
 
 ```
 # 1. Checkin to task (sessionUuid comes from the auto-injected task)
@@ -328,11 +336,9 @@ chorus_report_work({ taskUuid: "<my-task-uuid>", report: "...", sessionUuid: "<m
 chorus_session_checkout_task({ sessionUuid: "<my-session-uuid>", taskUuid: "<my-task-uuid>" })
 chorus_submit_for_verify({ taskUuid: "<my-task-uuid>", summary: "..." })
 
-# 6. (Optional) notify the team lead via mailbox — you need its agentId
-subagent_mailbox({ action: "send", agentId: "<team-lead-agentId>", message: "Task complete" })
-
-# DO NOT call chorus_close_session — the extension closes it when the
-# team lead runs subagent_manage({ action: "close", agentId: "<my-agentId>" })
+# The worker's final message is returned to the Team Lead as the subagent result.
+# DO NOT call chorus_close_session — the extension closes the session when the
+# blocking `subagent` call returns.
 ```
 
 ### Handling Task Dependencies (DAG)
@@ -341,24 +347,25 @@ subagent_mailbox({ action: "send", agentId: "<team-lead-agentId>", message: "Tas
 
 **Wave-based execution (recommended):**
 1. `chorus_get_unblocked_tasks` — find ready tasks
-2. `subagent_spawn` workers for Wave 1 (async; keep the agentIds)
-3. Wait for `to_verify` (poll `chorus_list_tasks` or read the async completion messages), then **verify each task** (`chorus_admin_verify_task` → `done`)
-4. `subagent_manage close` each finished worker (releases its slot + closes its Chorus session)
-5. `chorus_get_unblocked_tasks` — find newly unblocked tasks (Wave 2)
-6. Repeat until all tasks done
+2. Dispatch a `chorus-worker` per ready task in ONE blocking `subagent({ tasks: [...] })` call (max 8; batch if more). The call returns when the whole wave has finished (each worker at `to_verify`).
+3. **Verify each task** — spawn `chorus-task-reviewer`, act on its VERDICT, then `chorus_admin_verify_task` → `done`.
+4. `chorus_get_unblocked_tasks` — find newly unblocked tasks (Wave 2)
+5. Repeat until all tasks done
 
-> **Critical:** `to_verify` does NOT resolve dependencies — only `done` or `closed` does. The Team Lead must verify tasks between waves. Also remember to `subagent_manage close` finished workers — Pi limits concurrent sub-agents and `completed` does not release the slot.
+> **Critical:** `to_verify` does NOT resolve dependencies — only `done` or `closed` does. The Team Lead must verify tasks between waves. The blocking `subagent` call already released each worker's slot on return, so there is nothing to close.
 
 ### Multiple Tasks Per Sub-Agent
 
-A single sub-agent can work on multiple tasks sequentially:
+A single worker can handle several tasks sequentially — use single mode with an ordered list:
 
 ```
-subagent_spawn({
-  agent: "worker",
+subagent({
+  agent: "chorus-worker",
   task: "Your Chorus tasks (work in order):\n1. task-schema-uuid\n2. task-api-uuid (depends on #1)\n\nFor EACH task: checkin -> in_progress -> work -> report -> checkout -> submit_for_verify"
 })
 ```
+
+For strictly dependent stages where each step consumes the previous output, use chain mode: `subagent({ chain: [{ agent: "chorus-worker", task: "..." }, { agent: "chorus-worker", task: "... {previous} ..." }] })`.
 
 ### MCP Access for Sub-Agents
 

@@ -4,7 +4,7 @@ description: Quick Task workflow — skip Idea→Proposal, create tasks directly
 license: AGPL-3.0
 metadata:
   author: chorus
-  version: "0.16.4"
+  version: "0.17.0"
   category: project-management
   mcp_server: chorus
 ---
@@ -146,7 +146,7 @@ chorus_submit_for_verify({
 })
 ```
 
-Submitting is not final verification. Invoke the required independent task reviewer with the host agent's sub-agent mechanism, wait for it, and read the newest `VERDICT:` Task comment. `PASS` and `PASS WITH NOTES` continue. On `FAIL`, do not verify or hand off: fix every unresolved BLOCKER, repeat AC self-check and submission, then run a fresh independent task review.
+Submitting is not final verification. Invoke the required independent task reviewer with the host agent's sub-agent mechanism, wait for it, and read THIS round's `VERDICT:` Task comment — the one posted after your dispatch, not an older round's. `PASS` and `PASS WITH NOTES` continue. On `FAIL`, do not verify or hand off: fix every unresolved BLOCKER, repeat AC self-check and submission, then run a fresh independent task review.
 
 ### Step 8: Permission-Aware Verification
 

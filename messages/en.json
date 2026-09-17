@@ -50,6 +50,7 @@
     "currentAssignee": "Currently assigned to",
     "failedToAssign": "Failed to assign",
     "actions": "Actions",
+    "close": "Close",
     "genericError": "An error occurred. Please try again.",
     "unknown": "Unknown",
     "system": "System",
@@ -113,7 +114,17 @@
     "loadError": "Failed to load comments",
     "retry": "Retry",
     "loadingMore": "Loading more...",
-    "noMoreComments": "No more comments"
+    "noMoreComments": "No more comments",
+    "actionsLabel": "Actions for comment by {name}",
+    "actionsTitle": "Comment actions",
+    "actionsDescription": "Choose an action for {name}'s comment.",
+    "reply": "Reply",
+    "replyFailed": "Couldn't prepare the reply. Try again.",
+    "delete": "Delete",
+    "deleteTitle": "Delete comment?",
+    "deleteDescription": "This comment will be permanently deleted. This action cannot be undone.",
+    "deleteConfirm": "Delete comment",
+    "deleteFailed": "Couldn't delete the comment. Try again."
   },
   "mentions": {
     "noResults": "No results",
@@ -1003,6 +1014,7 @@
     "confirmCta": "Run Yolo",
     "starting": "Starting...",
     "startedHint": "Yolo started — the agent is driving this idea to done",
+    "completedHint": "This idea is already complete",
     "offlineHint": "Agent offline — enables on reconnect",
     "errorAgentOffline": "The assigned agent is offline. Run Yolo after it reconnects.",
     "errorInstanceOffline": "The idea is pinned to a daemon instance that is offline. Run Yolo after that instance reconnects.",
@@ -1161,31 +1173,39 @@
         "claudeCode": "Claude Code",
         "codex": "Codex",
         "kiro": "Kiro",
+        "pi": "Pi",
         "dsh": "DeepSeek Harness",
         "opencode": "OpenCode",
         "openClaw": "OpenClaw",
         "other": "Other Agents"
       },
+      "profileStep": {
+        "title": "Step 3 (optional): Set the default agent for the Chorus CLI",
+        "desc": "chorus agents add prints an export CHORUS_AGENT_PROFILE line for each configured agent. Add one to your shell to set which agent the chorus CLI acts as by default; its key is resolved from ~/.chorus/daemon.json."
+      },
       "claudeCode": {
         "step1Title": "Step 1: Set environment variables",
-        "step1Tip": "Tip: Add these to ~/.bashrc or ~/.zshrc for persistence.",
-        "step2Title": "Step 2: Open Claude Code and run"
+        "step1Tip": "No need to persist these — chorus agents add (Step 2) picks them up.",
+        "step2Title": "Step 2: Run chorus agents add",
+        "step2Tip": "chorus agents add installs the Chorus plugin into Claude Code and writes CHORUS_URL, CHORUS_API_KEY and CHORUS_AGENT_PROFILE into ~/.claude/settings.json — so interactive Claude Code needs no manual export."
       },
       "codex": {
         "step1Title": "Step 1: Set environment variables",
-        "step1Tip": "Tip: Add these to ~/.bashrc or ~/.zshrc for persistence.",
-        "step2Title": "Step 2: Run the Codex installer",
-        "step2Tip": "The script registers the plugin marketplace and writes the MCP server entry into ~/.codex/config.toml.",
-        "step3Title": "Step 3: Verify connection",
-        "step3Desc": "Open Codex and ask it to check in to Chorus — e.g. type \"check in to chorus\"."
+        "step1Tip": "No need to persist these — chorus agents add (Step 2) writes them to ~/.codex/.env.",
+        "step2Title": "Step 2: Run chorus agents add",
+        "step2Tip": "chorus agents add installs the Chorus plugin and writes CHORUS_URL, CHORUS_API_KEY and CHORUS_AGENT_PROFILE to ~/.codex/.env — so interactive Codex needs no manual export."
       },
       "kiro": {
         "step1Title": "Step 1: Set environment variables",
         "step1Tip": "Tip: Add these to ~/.bashrc or ~/.zshrc so Kiro CLI can read them on startup.",
-        "step2Title": "Step 2: Run the Kiro installer",
-        "step2Tip": "By default this installs globally into ~/.kiro/ so Chorus is available in every directory. For a project-local install into the current directory's .kiro/ instead, append the flag: bash -s -- --workspace.",
-        "step3Title": "Step 3: Verify connection",
-        "step3Desc": "Open Kiro CLI and activate the /chorus-idea skill, or start with the Chorus agent directly: kiro-cli --agent chorus."
+        "step2Title": "Step 2: Run chorus agents add",
+        "step2Tip": "chorus agents add installs the Chorus skills, agents, steering, and the chorus MCP server into ~/.kiro globally, so Chorus is available in every directory. It reads CHORUS_URL and CHORUS_API_KEY from your environment (Step 1). To install into a different directory, set KIRO_DIR before running. The first command installs the Chorus CLI globally (pinned to version 0.17.0)."
+      },
+      "pi": {
+        "step1Title": "Step 1: Set environment variables",
+        "step1Tip": "Tip: Add these to ~/.bashrc or ~/.zshrc so Pi can read them at runtime — chorus agents add writes an env-referenced key (not a literal) into ~/.pi/agent/mcp.json.",
+        "step2Title": "Step 2: Run chorus agents add",
+        "step2Tip": "chorus agents add --agents pi installs the pi-mcp-adapter and the chorus-pi plugin, writes the chorus MCP server into ~/.pi/agent/mcp.json (referencing CHORUS_API_KEY from your environment — no literal key), and seeds pi as a wakeable daemon agent. It reads CHORUS_URL and CHORUS_API_KEY from your environment (Step 1)."
       },
       "dsh": {
         "step1Title": "Step 1: Set environment variables",
@@ -1193,17 +1213,15 @@
         "step2Title": "Step 2: Add the Chorus bundle",
         "step2Tip": "Replace {name} with the dsh profile you want to use. The -w flag is required because a dsh profile is a pnpm workspace root. dsh owns the profile package state and satisfies the bundle's peer plugins.",
         "step3Title": "Step 3: Store credentials",
-        "step3Tip": "Writes CHORUS_URL and CHORUS_API_KEY to $DSH_HOME/.env (mode 0600). dsh scrubs credential-shaped variables from tool subprocesses, so the document-mirror wrapper reads them from this file, not the shell.",
+        "step3Tip": "chorus agents add validates your key and seeds CHORUS_URL and CHORUS_API_KEY into ~/.chorus/daemon.json (mode 0600), adding the Chorus bundle to the profile if needed. Pass --dsh-profile {name} to match the profile from Step 2; it reads the credentials from your environment (Step 1). The first command installs the Chorus CLI globally (pinned to version 0.17.0).",
         "step4Title": "Step 4: Launch and verify",
         "step4Desc": "Run dsh --profile {name}, then ask it to \"check in to chorus\"."
       },
       "opencode": {
         "step1Title": "Step 1: Set environment variables",
         "step1Tip": "Tip: Add these to ~/.bashrc or ~/.zshrc so the plugin can read them on OpenCode startup.",
-        "step2Title": "Step 2: Enable the Chorus plugin",
-        "step2Tip": "The installer idempotently adds \"opencode-chorus\" to the \"plugin\" array in ~/.config/opencode/opencode.json. It does not touch your shell rc. OpenCode installs the plugin via Bun on first launch.",
-        "step3Title": "Step 3: Verify connection",
-        "step3Desc": "Open OpenCode and ask the agent to \"check in to chorus\". This step auto-advances when the connection succeeds.",
+        "step2Title": "Step 2: Run chorus agents add",
+        "step2Tip": "chorus agents add idempotently adds \"opencode-chorus\" to the \"plugin\" array in ~/.config/opencode/opencode.json. It does not touch your shell rc; OpenCode installs the plugin via Bun on first launch. It reads CHORUS_URL and CHORUS_API_KEY from your environment (Step 1). The first command installs the Chorus CLI globally (pinned to version 0.17.0).",
         "troubleshootingTitle": "Troubleshooting",
         "issueCache": {
           "title": "Plugin not loaded",
@@ -1223,8 +1241,6 @@
         "step2Title": "Step 2: Edit ~/.openclaw/openclaw.json",
         "step3Title": "Step 3: Restart OpenClaw gateway",
         "step3Desc": "Restart the OpenClaw gateway process to pick up the new configuration.",
-        "step4Title": "Step 4: Verify connection",
-        "step4Desc": "In the OpenClaw chat window, type the following command:",
         "troubleshootingTitle": "Troubleshooting",
         "troubleshootingError": "\"Wake agent failed: HTTP 405\"",
         "troubleshootingFix": "This error means hooks are not enabled. Set \"hooks.enabled\" to true in your openclaw.json configuration and restart the gateway."
@@ -1247,6 +1263,18 @@
       "installGuide": "This step will guide you through installation. Coming soon.",
       "testConnection": "This step will test your agent connection. Coming soon."
     }
+  },
+  "activeSessions": {
+    "indicatorLabel": "{count, plural, one {1 daemon session running — open chat} other {# daemon sessions running — choose a chat}}",
+    "statusOnlyIndicatorLabel": "{count, plural, one {1 daemon session running — status only} other {# daemon sessions running — status only}}",
+    "chooserLabel": "Running daemon sessions",
+    "runningCount": "{count, plural, one {# running session} other {# running sessions}}",
+    "location": "{host} · {cwd}",
+    "unknownHost": "Unknown host",
+    "unknownCwd": "Unknown working directory",
+    "agentFallback": "Connection details are still loading",
+    "statusOnly": "Status only · owned by another user",
+    "statusOnlyEntry": "{agent} — status only"
   },
   "ideaTracker": {
     "overview": "Overview",
@@ -1358,6 +1386,17 @@
       "noActivity": "No recent activity"
     },
     "panel": {
+      "actions": {
+        "busy": "Wait for the current operation to finish",
+        "loadingStage": "Waiting for proposal and task data. If this persists, reopen the idea to retry.",
+        "verifyUnavailable": "Complete elaboration before verifying it",
+        "editUnavailable": "Elaborated ideas cannot be edited",
+        "copyLink": "Copy link",
+        "copyUuid": "Copy UUID",
+        "linkCopied": "Idea link copied",
+        "uuidCopied": "Idea UUID copied",
+        "copyFailed": "Could not copy. Check clipboard permissions and try again."
+      },
       "notFound": "Idea not found",
       "loadFailed": "Failed to load idea",
       "verifyingPlaceholder": "Verification in progress...",
@@ -1502,6 +1541,7 @@
     "clientCodex": "Codex",
     "clientKiro": "Kiro",
     "clientDsh": "DeepSeek Harness",
+    "clientPi": "Pi",
     "clientUnknown": "Unknown client",
     "uptimeMonoDays": "{days}d {time}",
     "mobileBack": "Connections",
@@ -1533,12 +1573,18 @@
     "entityUnknown": "Resource",
     "interrupt": "Interrupt",
     "interrupting": "Interrupting…",
+    "clearStuckTurnAria": "Clear this stuck turn",
     "interruptAria": "Interrupt this running execution",
     "interruptConfirmTitle": "Interrupt this execution?",
     "interruptConfirmBody": "This stops the daemon's running session for \"{title}\". The agent is asked to stop gracefully, then force-stopped if it doesn't. You can resume it afterward from this page.",
     "interruptConfirmAction": "Interrupt",
     "interruptSuccess": "Interrupt requested for \"{title}\".",
     "interruptError": "Failed to request interrupt. Please try again.",
+    "interruptStuckConfirmTitle": "Clear this stuck turn?",
+    "interruptStuckConfirmBody": "Chorus still shows a running turn for \"{title}\", but the daemon is not reporting any process for it. Clearing marks the turn as interrupted so the conversation is usable again. Nothing is killed — there is nothing left to kill. You can resume it afterward.",
+    "interruptStuckConfirmAction": "Clear the turn",
+    "interruptStuckRequested": "Asked the daemon to stop \"{title}\" \u2014 the turn clears when it reports back.",
+    "interruptStuckSuccess": "Cleared the stuck turn for \"{title}\".",
     "resume": "Resume",
     "resuming": "Resuming…",
     "resumeAria": "Resume this interrupted execution",
@@ -1576,6 +1622,7 @@
     "agentSessionCount": "{count, plural, one {# conversation} other {# conversations}}",
     "listHeader": "CONVERSATIONS",
     "loadMore": "Load more",
+    "loadingMore": "Loading more…",
     "loadEarlier": "Load earlier messages",
     "loadingEarlier": "Loading earlier…",
     "transcriptLoading": "Loading transcript…",
@@ -1641,6 +1688,7 @@
     "loadErrorTitle": "Couldn't load this conversation",
     "loadErrorBody": "We couldn't reach the transcript service. This is a loading problem, not an empty conversation. Retrying when you reopen it.",
     "originOfflineNote": "This conversation's origin daemon is offline, so it's read-only. Its history still shows; continue it on an online directory to send.",
+    "originOfflineNoteStuckTurn": "This conversation's origin daemon is offline, so it's read-only. Its history still shows; continue it on an online directory to send. The stuck turn can still be cleared here.",
     "continueOnlineAction": "Continue on an online directory",
     "continueOnlineHelp": "Keep this same conversation but continue it on one of this agent's online working directories. It picks up there with a fresh start (the history above stays as read-only context).",
     "continueOnlineStarted": "Continuing on the online directory",
@@ -1800,5 +1848,8 @@
     "docs": "Docs",
     "githubAria": "Open the Chorus GitHub repository (opens in a new tab)",
     "docsAria": "Open the Chorus documentation site (opens in a new tab)"
+  },
+  "markdown": {
+    "frontmatterLabel": "Document metadata"
   }
 }

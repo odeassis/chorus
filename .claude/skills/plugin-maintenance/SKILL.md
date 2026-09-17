@@ -61,14 +61,14 @@ packages/openclaw-plugin/       ← OpenClaw plugin package (TS runtime + skills
 public/kiro-plugin/             ← Kiro CLI plugin (loose .kiro/ template tree + install script)
   .kiro/
     settings/mcp.json           ← Chorus remote MCP server (${env:CHORUS_API_KEY} bearer, disabled:false)
-    skills/chorus-*/SKILL.md    ← 8 chorus-PREFIXED skills (no bare names — global-install distinctiveness)
+    skills/chorus-*/SKILL.md    ← the chorus-PREFIXED skills (no bare names — global-install distinctiveness)
     agents/chorus.json          ← main agent (.json — Kiro CLI, NOT .md); hosts all hooks via __CHORUS_BIN__ placeholder
     agents/chorus.md            ← main-agent system-prompt sidecar (file://./chorus.md)
     agents/chorus-*-reviewer.json  ← 3 read-only reviewer subagents (tools:["read","@chorus"])
     steering/chorus.md          ← platform overview + AI-DLC context (folds in the `chorus` overview skill)
   bin/                          ← Hook scripts (bash, 3.2-safe) + chorus-api.sh + test-syntax.sh
                                   installer copies these into <KIRO_DIR>/chorus-bin/ and resolves __CHORUS_BIN__
-(public/install-kiro.sh)        ← one-shot curl|bash installer → merges .kiro/ into ~/.kiro/ (or <cwd>/.kiro/ with --workspace)
+(public/install-kiro.sh)        ← deprecation stub → redirects to `chorus agents add`; the .kiro/ tree is installed by cli/init/file-template.mjs (asset list: public/kiro-plugin/manifest.txt)
 
 packages/chorus-pi/             ← Pi coding agent package (TS extension + skills)
   package.json                  ← npm package + Pi manifest (version here)
@@ -111,7 +111,7 @@ public/skill/                   ← Standalone skill (any MCP-compatible agent)
 | OpenSpec detection | SessionStart hook | SessionStart hook | Inline | `agentSpawn` hook | `session_start` extension event |
 | Runtime/hooks | Stateful bash hooks | Stateless bash hooks | TypeScript SSE runtime | Bash 3.2 hooks in `chorus.json` | TypeScript native extension; shell only for OpenSpec mirroring |
 | Task execution | Agent Teams waves | `spawn_agent` | Main-agent waves | Kiro subagents | `subagent_spawn` workers |
-| Install | Marketplace | `install-codex.sh` | OpenClaw plugin manager | `install-kiro.sh` | GitHub checkout + `pi install <checkout>/packages/chorus-pi` |
+| Install | Marketplace | `install-codex.sh` | OpenClaw plugin manager | `install-kiro.sh` | npm (`pi install npm:@chorus-aidlc/chorus-pi`) |
 
 When porting a change between plugins, preserve these intentional differences. Don't add state files to the Codex/OpenClaw plugins, don't use `$`-prefix outside Codex, keep OpenClaw's `chorus__` names and manual-session/inline-detection wording, and preserve Kiro's `chorus-` skill prefix, `@chorus/<tool>` matchers, and `__CHORUS_BIN__` placeholder. For Pi, use `/skill:<name>`, `subagent_spawn`, native extension events, and plain-text interaction; do not introduce Claude hooks or Codex session wording.
 
@@ -160,7 +160,7 @@ Every time **any** plugin package changes, bump the version in **all** of that p
 
 ### Kiro plugin — bump together
 Kiro has **no plugin.json / marketplace registry** (it reads loose `.kiro/` files), so the only versioned files are the skill frontmatters.
-10. Every skill under `public/kiro-plugin/.kiro/skills/chorus-*/SKILL.md` — `metadata.version: "X.Y.Z"` on the shared skill sequence (all 8 `chorus-*` skills). The `agents/*.json` and `steering/chorus.md` carry **no** version field — nothing to edit there.
+10. Every skill under `public/kiro-plugin/.kiro/skills/chorus-*/SKILL.md` — `metadata.version: "X.Y.Z"` on the shared skill sequence (all `chorus-*` skills). The `agents/*.json` and `steering/chorus.md` carry **no** version field — nothing to edit there.
 11. `public/kiro-plugin/bin/chorus-api.sh` — hardcoded `clientInfo.version` string in the JSON-RPC `initialize` payload (same as the Codex `chorus-mcp-call.sh` helper).
 
 ### Pi package — bump together
@@ -171,8 +171,50 @@ Kiro has **no plugin.json / marketplace registry** (it reads loose `.kiro/` file
 ### dsh (DeepSeek Harness) plugin — bump together
 dsh tracks the **app version** (currently `0.16.3`), NOT the 0.9.x skill sequence.
 16. `packages/chorus-dsh/package.json` — `"version": "X.Y.Z"` (the published `@chorus-aidlc/chorus-dsh` bundle).
-17. Every skill under `packages/chorus-dsh/skills/*/SKILL.md` — `metadata.version: "X.Y.Z"` (the `chorus/` overview + all 13 `-chorus`-suffixed stage/reviewer skills).
+17. Every skill under `packages/chorus-dsh/skills/*/SKILL.md` — `metadata.version: "X.Y.Z"` (the `chorus/` overview + all `-chorus`-suffixed stage/reviewer skills).
    - **Do NOT** hardcode a version in `bin/chorus-mcp-call.mjs` — its `clientInfo.version` is auto-read from `package.json`, so it never drifts.
+
+### Coordinated npm release identity
+
+When cutting an application release, the four public npm packages are one
+lockstep release unit. Set the same `X.Y.Z` in:
+
+1. root `package.json` (`@chorus-aidlc/chorus`);
+2. `packages/openclaw-plugin/package.json`
+   (`@chorus-aidlc/chorus-openclaw-plugin`) and refresh its standalone
+   `package-lock.json`;
+3. `packages/chorus-dsh/package.json`
+   (`@chorus-aidlc/chorus-dsh`);
+4. `packages/chorus-pi/package.json`
+   (`@chorus-aidlc/chorus-pi`) — no standalone lockfile to refresh (it rides the
+   workspace `pnpm-lock.yaml`); a plain version bump does not dirty the lockfile,
+   but if you changed its deps run `pnpm install --lockfile-only` at the repo
+   root (the release preflight runs `pnpm install --frozen-lockfile`).
+
+Publishing GitHub Release `vX.Y.Z` triggers
+`.github/workflows/publish-npm.yml`. The workflow completes all four package
+build/pack contracts before any upload, then publishes CLI → OpenClaw → dsh →
+chorus-pi. The older interactive package publish scripts are maintenance tools,
+not the CI release entry point.
+
+For all four npm package settings, Trusted Publisher must use the exact
+workflow filename `publish-npm.yml` in the matching GitHub repository. Leave
+the npm Environment field blank while the workflow job has no `environment`;
+if an Environment is introduced, configure the exact same case-sensitive name
+on npm and on the workflow job. Keep `id-token: write`, do not add
+`NPM_TOKEN`, `NODE_AUTH_TOKEN`, or a setup-node token placeholder, and do not
+disable npm's automatic provenance. A public-repository publish is accepted
+only after the workflow observes its SLSA provenance attestation.
+`@chorus-aidlc/chorus-pi` is the newest package: its Trusted Publisher must be
+registered on npmjs.org before its first coordinated publish, or the run stops
+at chorus-pi with the first three already published — a human/ops step, not
+something to fake or token-shim around.
+
+For partial publication, repair the external problem and choose **Re-run jobs**
+on the same failed Actions run. Do not create a replacement Release/version.
+The rerun skips exact versions already confirmed in npm and resumes in fixed
+order. A failed registry lookup is not a skip and must stop the run; the job
+summary identifies `failed` and `not-attempted` packages for diagnosis.
 
 ### Standalone skills — independent versioning
 15. `public/skill/*/SKILL.md` — bump only the standalone skills that changed, using their own version sequence.
@@ -203,11 +245,11 @@ Users update via:
 /plugin update chorus@chorus-plugins           # Claude Code
 codex plugin update chorus@chorus-plugins      # Codex
 # OpenClaw: reinstall/update via the OpenClaw plugin manager (npm spec @chorus-aidlc/chorus-openclaw-plugin)
-# Kiro: re-run the installer — curl -fsSL "$CHORUS_URL/install-kiro.sh" | bash  (idempotent; merges into ~/.kiro/)
-# Pi: pull the Chorus checkout, then reinstall its packages/chorus-pi local path
+# Kiro: re-run `chorus agents add --agents kiro` (idempotent; installs the .kiro/ tree via the file-template installer)
+# Pi: pi install npm:@chorus-aidlc/chorus-pi   (reinstall to pull the latest published extension)
 ```
 
-Pi accepts GitHub sources such as `pi install git:github.com/user/repo@ref`, but it does not support selecting a package subdirectory. Do not point it at the Chorus monorepo root: Pi would inspect the root `package.json`, not `packages/chorus-pi/package.json`. Until Pi is published from a dedicated package-root repository or branch, clone/pull Chorus and install the package by local path.
+Pi is published to npm as `@chorus-aidlc/chorus-pi` and installs with `pi install npm:@chorus-aidlc/chorus-pi` — the same path `chorus agents add` automates (select Pi, or `--agents pi`). The old sparse-git-checkout / local-path workaround is no longer needed; local-path `pi install ./packages/chorus-pi` is now only for developing chorus-pi from the repo checkout.
 
 ## Skill Content Changes — Seven Surfaces
 

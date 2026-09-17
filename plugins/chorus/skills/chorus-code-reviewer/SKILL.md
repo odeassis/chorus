@@ -1,10 +1,10 @@
 ---
 name: chorus-code-reviewer
-description: 'Read-only Chorus code-review gateway — the final ship-time review of an Idea''s aggregate code change (the whole feature across all its tasks, not one task). Fetches the Idea, its approved proposals, documents, and tasks via MCP, reviews the aggregate implementation, and posts a structured VERDICT comment on the Idea. Invoke by mounting this skill into a default sub-agent via spawn_agent(agent_type="default", items=[{ type: "skill", path: "chorus:chorus-code-reviewer", ... }, { type: "text", text: "Review the code for idea <uuid>. Round: N." }]).'
+description: 'Read-only Chorus code-review gateway — the final ship-time review of an Idea''s aggregate code change (the whole feature across all its tasks, not one task). Fetches the Idea, its approved proposals, documents, and tasks via MCP, reviews the aggregate implementation, and posts a structured VERDICT comment on the Idea. Invoke with spawn_agent({items:[{type:"skill", path:"chorus:chorus-code-reviewer"}, {type:"text", text:"Review the code for idea <idea-uuid>. Round: N. Post VERDICT."}]}).'
 license: AGPL-3.0
 metadata:
   author: chorus
-  version: "0.16.4"
+  version: "0.18.1"
   category: project-management
   mcp_server: chorus
   short-description: Adversarial Chorus code-review gateway
@@ -95,6 +95,7 @@ Read each task's work report (in its comments) — the developers describe what 
 4. **Regression risk / impact on untouched areas / performance** — does the change break or degrade code no single task owned? N+1s, hot-path cost, shared-state contention.
 5. **Feature-level test coverage adequacy** — across the whole feature, are integration seams and end-to-end paths tested, or only per-task units? Gaps between tasks.
 6. **Code soundness, simplicity, correctness** — is the aggregate change correct, reasonably simple, free of obvious defects read as one body of work.
+7. **Intent alignment (whole-feature)** — Also read the Idea's resolved elaboration (`chorus_get_elaboration`); using ONLY human-authored intent (Idea body + human-answered elaboration + human-authored comments; agent-authored entries are audit context, not intent) as the baseline, judge whether the aggregate change still serves the original intent. Flag scope creep, dropped requirements, or intent missed despite passing AC as a **BLOCKER**, unless a cited human entry / human override authorizes it.
 
 **Step 4: Run feature-level build/test.** Run the project's declared commands. A broken build or failing tests is an automatic FAIL. Record command + exit code + relevant output. Results are context — verify each dimension independently.
 

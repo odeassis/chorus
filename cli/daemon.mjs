@@ -31,6 +31,7 @@ import {
   yoloWarningLine,
 } from "./daemon-permission-mode.mjs";
 import { resolveAgentType, backendClientType } from "./daemon-agent.mjs";
+import { isWakeableAgentType } from "./init/agent-type-map.mjs";
 import { formatBanner, agentNotFoundWarningLine } from "./daemon-banner.mjs";
 import { ChorusClient, validateAndFetchIdentity } from "./chorus-client.mjs";
 import { SseListener } from "./sse-listener.mjs";
@@ -39,12 +40,13 @@ import { EventRouter } from "./event-router.mjs";
 import { WakeQueue } from "./wake-queue.mjs";
 import { Waker } from "./waker.mjs";
 import { LineageResolver } from "./lineage.mjs";
-import { resolveClaudePath } from "./claude-spawner.mjs";
+import { resolveClaudePath, isNewSession } from "./claude-spawner.mjs";
 import { resolveCodexPath } from "./codex-spawner.mjs";
 import { resolveDshPath } from "./dsh-spawner.mjs";
 import { prepareManagedDshConfig } from "./dsh-managed-config.mjs";
 import { resolveKiroPath } from "./kiro-spawner.mjs";
 import { selectSpawner } from "./spawner-select.mjs";
+import { overlayAgentEnv } from "./agent-cli-config.mjs";
 import {
   createExecutionUploadHooks,
   createTranscriptUploadHooks,
@@ -60,6 +62,7 @@ import {
   resolveDaemonCwds,
   resolveBrowseRoots,
   resolveAgentConfigs,
+  resolveFlatAgentCliConfig,
   hasConfiguredAgents,
 } from "./daemon-config.mjs";
 import { discoverDirectories, validateDirectory } from "./directory-discovery.mjs";
@@ -75,6 +78,7 @@ import {
   uninstallService,
   systemctlUser,
   journalctlUser,
+  launchctl,
   resolveServicePaths,
   SERVICE_NAME,
 } from "./daemon-service.mjs";
@@ -122,7 +126,7 @@ function defaultLogger() {
  *   maxConcurrency?: number,
  *   permissionMode?: "chorus"|"yolo",
  *   reportInterrupt?: (entityType: string, entityUuid: string, reason: "user"|"crash") => Promise<void>,
- *   advanceTurn?: (params: { sessionId: string, status: "running"|"ended", entityType?: string|null, entityUuid?: string|null }) => Promise<void>,
+ *   advanceTurn?: (params: { sessionId: string, status: "running"|"ended"|"interrupted", interruptedReason?: "user"|"crash"|"shutdown"|"invalid_path"|null, entityType?: string|null, entityUuid?: string|null }) => Promise<void>,
  *   sigintTimeoutMs?: number,
  * }} [deps]
  */
@@ -155,6 +159,10 @@ export function buildDaemon(creds, deps = {}) {
   // passed through so the Codex backend can export the daemon key into the woken
   // process env (the Claude backend ignores creds — it gets its key via --mcp-config).
   const spawner = deps.spawner ?? selectSpawner(agentType, {
+    ...deps.spawnerOptions,
+    cliConfig: deps.cliConfig,
+    env: deps.env,
+    label: deps.label,
     logger,
     permissionMode,
     creds,
@@ -304,6 +312,7 @@ export function buildDaemon(creds, deps = {}) {
         creds,
         lineage,
         spawner,
+        isNewSessionFn: (sessionId, runCwd) => isNewSession(sessionId, runCwd, { env: spawner.env, platform: spawner.platform }),
         cwd: boundCwd,
         hooks,
         logger,
@@ -421,6 +430,10 @@ export function buildDaemon(creds, deps = {}) {
       sigintTimeoutMs,
       redispatchResume,
       deliverTurn,
+      // The SAME turn reporter the wakers use (declared above and passed into
+      // makeWaker) — one transport, so a no-child interrupt can close the
+      // server-side `running` turn (fix-phantom-running-turn, Tech Design D).
+      advanceTurn,
       handleDirectoryRequest: async (event) => {
         if (event.operation === "roots") {
           return { roots: [...browseRoots] };
@@ -633,6 +646,27 @@ export function buildMultiAgentDaemon(agentConfigs, deps = {}) {
 
   const agents = agentConfigs
     .map((cfg, i) => {
+      // Offline agents are proxy-only: their key is parked in daemon.json solely so
+      // `chorus mcp` can act under that identity (it reads the file directly, not via
+      // this runtime). The daemon-multi-agent spec says the daemon SHALL NOT construct
+      // a spawner, dispatch wakes, OR register it as a wakeable connection. Building a
+      // runtime here would open an SSE stream that self-reports a connection — so we
+      // SKIP the offline agent entirely (no runtime, no connection, no self-report),
+      // which is what closes the T4-review registration gap. Returning null (kept in
+      // step with a build failure) preserves the original index `i` for the per-agent
+      // injected-dep alignment below (map keeps the index; the filter drops the null).
+      // Skip = not woken: an offline backend (can't be woken) OR a wakeable backend
+      // the operator opted out of (`daemonWake: false`). Both get the same proxy-only
+      // treatment (no runtime/SSE/connection); the key stays in daemon.json for
+      // `chorus mcp`. `daemonWake` absent/true ⇒ woken (back-compat with entries that
+      // predate the field).
+      if (cfg.agentType === "offline" || cfg.daemonWake === false) {
+        const why = cfg.agentType === "offline" ? "offline backend" : "daemon waking disabled (daemonWake:false)";
+        logger.info?.(
+          `[Chorus] agent ${cfg.label}: ${why} — proxy-only key, no wakeable connection registered`,
+        );
+        return null;
+      }
       // Per-agent deps: cfg fields drive the per-agent runtime; injectable fakes are
       // indexed per agent. `cwd` (singular) is cleared so a caller's single value can
       // never leak across agents — each agent's `cwds` is authoritative.
@@ -641,6 +675,8 @@ export function buildMultiAgentDaemon(agentConfigs, deps = {}) {
         logger,
         permissionMode: cfg.permissionMode,
         agentType: cfg.agentType,
+        cliConfig: { args: cfg.args, env: cfg.env },
+        label: cfg.label,
         cwds: cfg.cwds,
         cwd: undefined,
         maxConcurrency: cfg.maxConcurrency,
@@ -655,7 +691,13 @@ export function buildMultiAgentDaemon(agentConfigs, deps = {}) {
           : deps.makeSseListener,
       };
       try {
-        return { cfg, daemon: build({ url: cfg.url, apiKey: cfg.apiKey }, agentDeps) };
+        return {
+          cfg,
+          daemon: build(
+            { url: cfg.url, apiKey: cfg.apiKey, agentUuid: cfg.agentUuid, agentName: cfg.agentName },
+            agentDeps,
+          ),
+        };
       } catch (err) {
         logger.error?.(
           `[Chorus] agent ${cfg.label}: failed to build runtime — skipping ` +
@@ -667,6 +709,33 @@ export function buildMultiAgentDaemon(agentConfigs, deps = {}) {
     .filter(Boolean);
 
   if (agents.length === 0) {
+    // Distinguish "all offline" (nothing wakeable to serve — not an error) from
+    // "every wakeable runtime threw" (a real build failure). An all-offline config
+    // is a legitimate proxy-only setup: return an idle no-op daemon so the process
+    // stays up (its offline keys remain available to `chorus mcp`) rather than
+    // crashing with a misleading "all runtimes failed" error.
+    const anyWakeable = agentConfigs.some(
+      (cfg) => isWakeableAgentType(cfg.agentType) && cfg.daemonWake !== false,
+    );
+    if (!anyWakeable) {
+      logger.warn?.(
+        "[Chorus] all configured agents are offline — no daemon-wakeable backend to serve. " +
+          "Offline keys remain in daemon.json for `chorus mcp`; the daemon has nothing to wake.",
+      );
+      return {
+        agents: [],
+        connections: [],
+        // No wakeable connection was registered, so there are no back-compat aliases.
+        waker: undefined,
+        router: undefined,
+        sseListener: undefined,
+        // Never settles: an idle daemon simply waits (it registered no connection, so
+        // it can never be "all-conflicted"). runDaemon keeps it alive on waitForever.
+        allConflict: new Promise(() => {}),
+        async start() {},
+        async stop() {},
+      };
+    }
     throw new Error("buildMultiAgentDaemon: all agent runtimes failed to build");
   }
 
@@ -783,6 +852,7 @@ export async function runDaemon(flags = {}, deps = {}) {
     uninstallService,
     systemctlUser,
     journalctlUser,
+    launchctl,
     resolveServicePaths: () => resolveServicePaths(env),
   };
   // The preflight dep bundle — built from the same seams runDaemon resolved, so
@@ -803,6 +873,19 @@ export async function runDaemon(flags = {}, deps = {}) {
   const action = flags.action ?? "run";
   if (action !== "run") {
     return handleLifecycleAction(action, { log, errLog, lifecycle, service, pfDeps });
+  }
+
+  // Validate flat customization before credential/network preflight, including
+  // the detach path. Lifecycle-only actions above do not launch an agent.
+  const multiAgent = hasConfiguredAgents({ readJson: deps.readJson, loginPath: deps.loginPath });
+  let cliConfig;
+  if (!multiAgent) {
+    try {
+      cliConfig = resolveFlatAgentCliConfig(agentType, { readJson: deps.readJson, loginPath: deps.loginPath });
+    } catch (error) {
+      errLog(`[Chorus] ${error.message}`);
+      return 1;
+    }
   }
 
   // `-d` / --detach: complete any interactive preflight in THIS foreground process
@@ -832,7 +915,7 @@ export async function runDaemon(flags = {}, deps = {}) {
   // credential preflight (interactive credential completion is a single-agent
   // affordance). Each agent authenticates on its own key; a failure is isolated
   // (logged + that agent skipped) so the rest still serve.
-  if (hasConfiguredAgents({ readJson: deps.readJson, loginPath: deps.loginPath })) {
+  if (multiAgent) {
     const buildMulti = deps.buildMulti ?? buildMultiAgentDaemon;
     let agentConfigs;
     try {
@@ -860,6 +943,11 @@ export async function runDaemon(flags = {}, deps = {}) {
     for (const cfg of agentConfigs) {
       try {
         const id = await validate({ url: cfg.url, apiKey: cfg.apiKey });
+        // The validated identity is authoritative for the CHORUS_AGENT_PROFILE the
+        // spawner exports — fill from it when daemon.json omitted the field
+        // (resolveAgentConfigs already normalized these to a trimmed string | undefined).
+        cfg.agentUuid = cfg.agentUuid ?? id.uuid;
+        cfg.agentName = cfg.agentName ?? id.name;
         okConfigs.push(cfg);
         log(
           `[Chorus] agent ${cfg.label}: ${id.name} (${id.uuid}) — ${cfg.agentType}, ` +
@@ -888,6 +976,7 @@ export async function runDaemon(flags = {}, deps = {}) {
     const multiDaemon = buildMulti(okConfigs, {
       logger: { info: log, warn: errLog, error: errLog },
       verbose,
+      env,
       fetchImpl: deps.fetchImpl,
       killer: deps.killer,
       sseListener: deps.sseListener,
@@ -938,16 +1027,17 @@ export async function runDaemon(flags = {}, deps = {}) {
   // Detect the SELECTED backend's executable (non-fatal): the daemon still
   // subscribes when it's missing; a wake surfaces the error visibly when one
   // arrives. The resolved path (or absence) is shown in the banner below. Each
-  // backend probes its own binary, including dsh-jsonrpc-agent for dsh, so the
+  // backend probes its own binary, including the `dsh` CLI for dsh, so the
   // startup banner and warning report the selected runtime rather than Claude.
+  const discoveryEnv = overlayAgentEnv(env, cliConfig.env);
   const cliPath =
     agentType === "codex"
-      ? findCodex()
+      ? findCodex({ env: discoveryEnv })
       : agentType === "kiro"
-        ? findKiro()
+        ? findKiro({ env: discoveryEnv })
         : agentType === "dsh"
-          ? findDsh()
-          : findClaude();
+          ? findDsh({ env: discoveryEnv })
+          : findClaude({ env: discoveryEnv });
 
   // The daemon.json the layered config readers (credentials, sigint timeout, cwds)
   // consult. Surfacing its absolute path + presence in the banner makes it obvious
@@ -998,10 +1088,16 @@ export async function runDaemon(flags = {}, deps = {}) {
   }
   log(`[Chorus] browse roots: ${browseRoots.join(", ")} (discovery only; no connections created)`);
 
-  const daemon = build(creds, {
+  const daemon = build(
+    // Export this agent's identity as CHORUS_AGENT_PROFILE in the woken session
+    // (the validated identity is authoritative; creds may already carry it).
+    { ...creds, agentUuid: creds.agentUuid ?? identity.uuid, agentName: creds.agentName ?? identity.name },
+    {
     logger: { info: log, warn: errLog, error: errLog },
     permissionMode,
     agentType,
+    cliConfig,
+    env,
     verbose,
     sigintTimeoutMs,
     cwds,
@@ -1118,11 +1214,13 @@ export async function preflight(ctx) {
 /**
  * Dispatch a daemon lifecycle subcommand. Two families:
  *   - install / uninstall — manage the boot-autostart supervisor service
- *     (systemd --user on Linux; a printed template on macOS/Windows).
+ *     (systemd --user on Linux; launchd LaunchAgent on macOS; a printed template
+ *     on Windows/other).
  *   - status / stop / restart / logs — when a supervisor unit is installed and
- *     active, DELEGATE to it (systemctl / journalctl) so a supervised daemon is
- *     never misreported as "not running"; otherwise operate on the
- *     pidfile/logfile-managed `-d` background daemon exactly as before.
+ *     active, DELEGATE to it (systemctl / journalctl on Linux, launchctl on
+ *     macOS) so a supervised daemon is never misreported as "not running";
+ *     otherwise operate on the pidfile/logfile-managed `-d` background daemon
+ *     exactly as before.
  * Each reports clearly (no silent failure). `restart` performs
  * stop-then-detached-start on the pidfile path.
  * @returns {Promise<number>} exit code
@@ -1204,8 +1302,7 @@ export async function handleLifecycleAction(action, { log, errLog, lifecycle, se
     });
     if (
       installAgent.agent === "dsh" &&
-      !String(env.CHORUS_DSH_CONFIG ?? "").trim() &&
-      !String(env.DSH_CORDIS_CONFIG ?? "").trim()
+      !String(env.CHORUS_DSH_HOME ?? "").trim()
     ) {
       try {
         await (pfDeps?.prepareManagedDshConfig ?? prepareManagedDshConfig)({
@@ -1239,21 +1336,26 @@ export async function handleLifecycleAction(action, { log, errLog, lifecycle, se
       for (const s of r.steps) log(`[Chorus]   ${s}`);
       log(`[Chorus] it will now start automatically at login. Manage it with:`);
       log(`[Chorus]   chorus daemon status | stop | restart | logs`);
-      // A --user service only survives logout with lingering enabled; and a
-      // separately-started `chorus daemon -d` would hold the same paths and make
-      // this service exit-and-retry. Surface both so neither is a silent gotcha.
-      log(`[Chorus] to keep it running after you log out: loginctl enable-linger "$USER"`);
-      log(`[Chorus] if you previously ran 'chorus daemon -d', stop it first ('chorus daemon stop') so it doesn't hold the same paths.`);
+      if (r.platform === "linux") {
+        // A --user service only survives logout with lingering enabled; and a
+        // separately-started `chorus daemon -d` would hold the same paths and make
+        // this service exit-and-retry. Surface both so neither is a silent gotcha.
+        log(`[Chorus] to keep it running after you log out: loginctl enable-linger "$USER"`);
+        log(`[Chorus] if you previously ran 'chorus daemon -d', stop it first ('chorus daemon stop') so it doesn't hold the same paths.`);
+      } else if (r.platform === "darwin") {
+        log(`[Chorus] if you previously ran 'chorus daemon -d', stop it first ('chorus daemon stop') so it doesn't hold the same paths.`);
+      }
       return 0;
     }
-    if (r.platform === "linux") {
-      // Linux install actually failed (write / systemctl error) — surface it.
+    if (r.platform === "linux" || r.platform === "darwin") {
+      // A real install (systemd/launchd) actually failed — surface it, never a
+      // silent success or a misleading "not supported" message.
       errLog(`[Chorus] service install failed: ${r.error}`);
       for (const s of r.steps) errLog(`[Chorus]   (did: ${s})`);
       return 1;
     }
-    // macOS / Windows: not auto-installed by design — print the template + steps.
-    log(`[Chorus] automatic install is Linux-only. To run the daemon as a service on this platform:`);
+    // Windows / other: no first-class auto-install — print the template + steps.
+    log(`[Chorus] automatic install is not supported on this platform. To run the daemon as a service:`);
     for (const s of r.steps) log(`[Chorus]   ${s}`);
     log("");
     log(r.unitText);
@@ -1261,7 +1363,7 @@ export async function handleLifecycleAction(action, { log, errLog, lifecycle, se
   }
   if (action === "uninstall") {
     const r = svc.uninstallService();
-    if (r.platform === "linux") {
+    if (r.platform === "linux" || r.platform === "darwin") {
       if (r.error) {
         errLog(`[Chorus] service uninstall failed: ${r.error}`);
         return 1;
@@ -1274,19 +1376,29 @@ export async function handleLifecycleAction(action, { log, errLog, lifecycle, se
       }
       return 0;
     }
-    log(`[Chorus] automatic uninstall is Linux-only. To remove the service on this platform:`);
+    log(`[Chorus] automatic uninstall is not supported on this platform. To remove the service:`);
     for (const s of r.steps) log(`[Chorus]   ${s}`);
     return 0;
   }
 
   // For the control verbs, prefer a live supervisor unit over the pidfile.
+  // A supervisor is systemd (Linux) or launchd (macOS); both delegate the verbs
+  // to their service manager so a supervised daemon is never misreported as "not
+  // running" via the pidfile.
   const sup = svc.detectSupervisor();
-  const supervised = sup.kind === "systemd" && sup.installed;
+  const systemd = sup.kind === "systemd" && sup.installed;
+  const launchd = sup.kind === "launchd" && sup.installed;
 
   if (action === "status") {
-    if (supervised) {
+    if (systemd) {
       log(`[Chorus] daemon is managed by systemd (${SERVICE_NAME}.service) — ${sup.active ? "active" : "installed but NOT active"}.`);
       const r = svc.systemctlUser(["status", "--no-pager", `${SERVICE_NAME}.service`]);
+      if (r.stdout) log(r.stdout.trimEnd());
+      return sup.active ? 0 : 1;
+    }
+    if (launchd) {
+      log(`[Chorus] daemon is managed by launchd (${sup.label}) — ${sup.active ? "loaded" : "installed but NOT loaded"}.`);
+      const r = svc.launchctl(["list", sup.label]);
       if (r.stdout) log(r.stdout.trimEnd());
       return sup.active ? 0 : 1;
     }
@@ -1297,7 +1409,7 @@ export async function handleLifecycleAction(action, { log, errLog, lifecycle, se
     return 0;
   }
   if (action === "logs") {
-    if (supervised) {
+    if (systemd) {
       const r = svc.journalctlUser(["-u", `${SERVICE_NAME}.service`, "--no-pager", "-n", "200"]);
       if (r.status !== 0 && !r.stdout) {
         errLog(`[Chorus] could not read the service journal: ${r.stderr.trim() || `exit ${r.status}`}`);
@@ -1306,6 +1418,8 @@ export async function handleLifecycleAction(action, { log, errLog, lifecycle, se
       log(r.stdout.trimEnd());
       return 0;
     }
+    // launchd (and the pidfile path) both log to ~/.chorus/daemon.log — the plist
+    // routes stdout/stderr there — so the pidfile logfile reader serves both.
     const r = lifecycle.readLog();
     if (!r.ok) {
       errLog(`[Chorus] ${r.message}`);
@@ -1315,11 +1429,21 @@ export async function handleLifecycleAction(action, { log, errLog, lifecycle, se
     return 0;
   }
   if (action === "stop") {
-    if (supervised) {
+    if (systemd) {
       const r = svc.systemctlUser(["stop", `${SERVICE_NAME}.service`]);
       if (r.status === 0) {
         log(`[Chorus] stopped the daemon service (systemctl --user stop ${SERVICE_NAME}.service).`);
         log(`[Chorus] note: it is still enabled and will start again at next login. To disable: chorus daemon uninstall`);
+        return 0;
+      }
+      errLog(`[Chorus] failed to stop the service: ${r.stderr.trim() || `exit ${r.status}`}`);
+      return 1;
+    }
+    if (launchd) {
+      const r = svc.launchctl(["unload", sup.plistPath]);
+      if (r.status === 0) {
+        log(`[Chorus] stopped the daemon service (launchctl unload ${sup.plistPath}).`);
+        log(`[Chorus] note: it will load again at next login. To disable: chorus daemon uninstall`);
         return 0;
       }
       errLog(`[Chorus] failed to stop the service: ${r.stderr.trim() || `exit ${r.status}`}`);
@@ -1336,10 +1460,21 @@ export async function handleLifecycleAction(action, { log, errLog, lifecycle, se
     return ok ? 0 : 1;
   }
   if (action === "restart") {
-    if (supervised) {
+    if (systemd) {
       const r = svc.systemctlUser(["restart", `${SERVICE_NAME}.service`]);
       if (r.status === 0) {
         log(`[Chorus] restarted the daemon service (systemctl --user restart ${SERVICE_NAME}.service).`);
+        return 0;
+      }
+      errLog(`[Chorus] failed to restart the service: ${r.stderr.trim() || `exit ${r.status}`}`);
+      return 1;
+    }
+    if (launchd) {
+      // launchd has no atomic restart — unload then load the same plist.
+      svc.launchctl(["unload", sup.plistPath]);
+      const r = svc.launchctl(["load", sup.plistPath]);
+      if (r.status === 0) {
+        log(`[Chorus] restarted the daemon service (launchctl unload+load ${sup.plistPath}).`);
         return 0;
       }
       errLog(`[Chorus] failed to restart the service: ${r.stderr.trim() || `exit ${r.status}`}`);

@@ -3,7 +3,7 @@
 // engineering point of the daemon: parsing stream-json is plain JS and
 // platform-neutral; the real work is spawning, and it is all Windows.
 //
-// Verified against Claude Code CLI 2.1.177:
+// Verified against Claude Code CLI 2.1.251:
 //   • `-p/--print` + `--output-format stream-json` emits NDJSON (one JSON object
 //     per line); every line carries `session_id`.
 //   • `--session-id <uuid>` sets the session id for a fresh run, and
@@ -23,14 +23,39 @@
 // carried per-turn by the wake-prompt preamble in prompts.mjs, not at the system level.
 
 import { spawn } from "node:child_process";
+import { safeSpawnError } from "./launch-diagnostics.mjs";
+import { validateAgentCliConfig, overlayAgentEnv, getAgentEnv, assertConfiguredShimArgs } from "./agent-cli-config.mjs";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { win32 as pathWin32, posix as pathPosix, join as pathJoin } from "node:path";
+import { awaitChildSettled } from "./child-exit.mjs";
 
 const NOOP_LOGGER = { info() {}, warn() {}, error() {} };
 
 /** Matches a canonical lowercase UUID (any version). Chorus idea uuids are v4. */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** Backend-neutral failure classification consumed by the wake orchestrator. */
+export const SESSION_CONFLICT_FAILURE = "session_conflict";
+
+const STDERR_BUFFER_LIMIT = 64 * 1024;
+const SESSION_CONFLICT_RE = /\bsession id\b[^\r\n]{0,200}\bis already in use\b/i;
+const CLAUDE_PROJECT_KEY_CAP = 200;
+
+/**
+ * Claude Code 2.1.251's Java-style signed 32-bit string hash, rendered as the
+ * absolute value in base36. Iterating by index intentionally hashes UTF-16 code
+ * units (including each surrogate in an astral character) rather than code points.
+ * @param {string} value
+ * @returns {string}
+ */
+function projectKeyHash(value) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash << 5) - hash + value.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash).toString(36);
+}
 
 /**
  * True iff `id` is a well-formed, lowercase UUID. The daemon anchors the Claude
@@ -45,22 +70,27 @@ export function isValidSessionId(id) {
 }
 
 /**
- * Claude Code's transcript directory for a working directory. Verified against the
- * live install: claude escapes the ABSOLUTE cwd by replacing both `/` and `.` with
- * `-` (e.g. `/home/u/dev/ai-pm` → `-home-u-dev-ai-pm`,
- * `/home/u/.cfg/x` → `-home-u--cfg-x`). On Windows the separators/drive differ, so
- * we escape backslashes and colons too; the rule there is best-effort and must be
- * re-verified against a Windows claude before claiming Windows resume support.
+ * Claude Code's transcript directory for a working directory. Verified against
+ * Claude Code 2.1.251's live Linux install and on-disk transcripts: every
+ * non-ASCII-alphanumeric UTF-16 code unit becomes `-`. That includes separators,
+ * dots, spaces, underscores, and non-ASCII characters; existing hyphens remain
+ * byte-identical because replacing `-` with `-` is a no-op. Escaped keys longer
+ * than 200 characters use the first 200 characters plus `-` and the base36
+ * Java-style signed 32-bit hash of the original cwd. The same expression produces
+ * the established Windows fixture, though the Windows on-disk layout remains
+ * best-effort until verified on a Windows Claude installation.
  * @param {string} cwd  Absolute working directory.
  * @param {NodeJS.Platform} [platform]
  * @returns {string}
  */
 export function escapeCwd(cwd, platform = process.platform) {
-  // Replace path separators and dots with `-`. On POSIX that's `/` and `.`; on
-  // Windows also `\` and the drive-colon. Collapsing both `/` and `.` is what
-  // produces the verified double-dash on a leading-dot segment.
-  const re = platform === "win32" ? /[\\/.:]/g : /[/.]/g;
-  return cwd.replace(re, "-");
+  // `platform` remains in the signature for fixture/API compatibility. Claude's
+  // observed sanitizer is platform-independent; platform path syntax supplies
+  // the differing separator/drive characters that this expression normalizes.
+  void platform;
+  const escaped = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+  if (escaped.length <= CLAUDE_PROJECT_KEY_CAP) return escaped;
+  return `${escaped.slice(0, CLAUDE_PROJECT_KEY_CAP)}-${projectKeyHash(cwd)}`;
 }
 
 /**
@@ -75,7 +105,7 @@ export function escapeCwd(cwd, platform = process.platform) {
 export function transcriptPath(sessionId, cwd, deps = {}) {
   const env = deps.env ?? process.env;
   const platform = deps.platform ?? process.platform;
-  const configDir = env.CLAUDE_CONFIG_DIR || pathJoin(deps.home ?? homedir(), ".claude");
+  const configDir = getAgentEnv(env, "CLAUDE_CONFIG_DIR", platform) || pathJoin(deps.home ?? getAgentEnv(env, "HOME", platform) ?? getAgentEnv(env, "USERPROFILE", platform) ?? homedir(), ".claude");
   return pathJoin(configDir, "projects", escapeCwd(cwd, platform), `${sessionId}.jsonl`);
 }
 
@@ -119,8 +149,9 @@ export function resolveClaudePath(deps = {}) {
     });
 
   // An explicit override always wins (set by the daemon if the user configured it).
-  if (env.CHORUS_CLAUDE_PATH && isFile(env.CHORUS_CLAUDE_PATH)) {
-    return env.CHORUS_CLAUDE_PATH;
+  const override = getAgentEnv(env, "CHORUS_CLAUDE_PATH", platform);
+  if (override && isFile(override)) {
+    return override;
   }
 
   // Use platform-correct path semantics so the resolver is testable for
@@ -128,7 +159,7 @@ export function resolveClaudePath(deps = {}) {
   const isWin = platform === "win32";
   const p = isWin ? pathWin32 : pathPosix;
   const names = isWin ? ["claude.cmd", "claude.exe", "claude"] : ["claude"];
-  const pathVar = env.PATH || env.Path || "";
+  const pathVar = getAgentEnv(env, "PATH", platform) || env.Path || "";
   const dirs = pathVar.split(p.delimiter).filter(Boolean);
   for (const dir of dirs) {
     for (const name of names) {
@@ -201,7 +232,7 @@ export function resolveSpawnCommand(claudePath, args, platform = process.platfor
   const isWin = platform === "win32";
   const lower = claudePath.toLowerCase();
   if (isWin && (lower.endsWith(".cmd") || lower.endsWith(".bat"))) {
-    const comspec = env.ComSpec || env.COMSPEC || "cmd.exe";
+    const comspec = getAgentEnv(env, "COMSPEC", platform) || "cmd.exe";
     // /d skip AutoRun, /s treat everything after /c literally, /c run then exit.
     return { command: comspec, argv: ["/d", "/s", "/c", claudePath, ...args] };
   }
@@ -262,6 +293,8 @@ export class ClaudeSpawner {
     // can group-kill the tree; Windows does not. Injectable so a POSIX test host
     // can exercise the Windows branch and vice versa.
     this.platform = opts.platform ?? process.platform;
+    this.cliConfig = validateAgentCliConfig(opts.cliConfig, "claude-code", opts.label);
+    this.env = overlayAgentEnv(opts.env ?? process.env, this.cliConfig.env, this.platform);
   }
 
   /**
@@ -284,7 +317,8 @@ export class ClaudeSpawner {
    *   so the waker can store the handle in its execution registry for the interrupt
    *   path BEFORE this promise resolves. It is invoked once, synchronously, only on a
    *   successful spawn; a spawn failure never calls it.
-   * @returns {Promise<{ sessionId: string, backendSessionId: string|null, exitCode: number|null, isNew: boolean }>}
+   * @returns {Promise<{ sessionId: string, backendSessionId: string|null, exitCode: number|null, isNew: boolean,
+   *                     failureClassification?: "session_conflict" }>}
    *   `backendSessionId` is the Claude `--resume` anchor (the input `sessionId`) on a
    *   terminal resolution after a spawn, so the conversation UI can offer a resumable
    *   id — mirrors codex-spawner's shape. `null` on the pre-spawn failure paths (no
@@ -302,18 +336,19 @@ export class ClaudeSpawner {
       return { sessionId: typeof id === "string" ? id : "", backendSessionId: null, exitCode: null, isNew: Boolean(isNew) };
     }
 
-    const claudePath = this.claudePath ?? resolveClaudePath();
+    const claudePath = this.claudePath ?? resolveClaudePath({ env: this.env, platform: this.platform });
     if (!claudePath) {
       // No crash — surface visibly and resolve with a failure result.
       this.logger.error("[Chorus] cannot locate the `claude` executable on PATH; skipping wake");
       return { sessionId: id, backendSessionId: null, exitCode: null, isNew };
     }
 
-    const args = buildArgs({ sessionId: id, isNew, mcpConfigPath, permissionMode: this.permissionMode });
+    assertConfiguredShimArgs(claudePath, this.cliConfig.args, this.platform);
+    const args = [...buildArgs({ sessionId: id, isNew, mcpConfigPath, permissionMode: this.permissionMode }), ...this.cliConfig.args];
     // On Windows, a .cmd/.bat shim must be run via cmd.exe /c (CreateProcess
     // can't exec a script directly). resolveSpawnCommand keeps shell:false and
     // passes argv as an array — no shell injection surface either way.
-    const { command, argv } = resolveSpawnCommand(claudePath, args);
+    const { command, argv } = resolveSpawnCommand(claudePath, args, this.platform, this.env);
 
     // POSIX: spawn `detached: true` so the child becomes a PROCESS GROUP LEADER
     // (its pgid === its pid). The interrupt path then signals the whole group via
@@ -325,10 +360,17 @@ export class ClaudeSpawner {
     // stream and observe the exit. On Windows `detached` is NOT used: taskkill /T
     // walks the tree by pid, and detached there only spawns a new console window.
     const detached = (this.platform ?? process.platform) !== "win32";
-    const childEnv = { ...process.env, CHORUS_DAEMON_HEADLESS: "1" };
+    const childEnv = { ...this.env, CHORUS_DAEMON_HEADLESS: "1" };
+    for (const key of Object.keys(childEnv)) {
+      if (["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"].includes(key.toUpperCase())) delete childEnv[key];
+    }
     if (this.creds) {
       if (this.creds.url) childEnv.CHORUS_URL = this.creds.url;
       if (this.creds.apiKey) childEnv.CHORUS_API_KEY = this.creds.apiKey;
+      // Identity profile for the woken session — its hooks/skills pass this to
+      // `chorus mcp --agent`, which resolves the key from ~/.chorus/daemon.json.
+      if (this.creds.agentUuid || this.creds.agentName)
+        childEnv.CHORUS_AGENT_PROFILE = this.creds.agentUuid || this.creds.agentName;
     }
 
     return new Promise((resolve) => {
@@ -347,8 +389,8 @@ export class ClaudeSpawner {
           detached,
           windowsHide: true,
         });
-      } catch (err) {
-        this.logger.error(`[Chorus] failed to spawn claude: ${err}`);
+      } catch (error) {
+        this.logger.error(`[Chorus] failed to spawn claude: ${safeSpawnError(error)}`);
         resolve({ sessionId: id, backendSessionId: null, exitCode: null, isNew });
         return;
       }
@@ -365,6 +407,8 @@ export class ClaudeSpawner {
       }
 
       let stdoutBuf = "";
+      let stderrBuf = "";
+      let sessionConflictSeen = false;
       let observedSessionId = id;
 
       child.stdout?.setEncoding?.("utf8");
@@ -388,26 +432,35 @@ export class ClaudeSpawner {
 
       child.stderr?.setEncoding?.("utf8");
       child.stderr?.on("data", (chunk) => {
-        const text = String(chunk).trim();
+        const rawText = String(chunk);
+        stderrBuf = (stderrBuf + rawText).slice(-STDERR_BUFFER_LIMIT);
+        if (SESSION_CONFLICT_RE.test(stderrBuf)) sessionConflictSeen = true;
+        const text = rawText.trim();
         if (text) this.logger.warn(`[Chorus] claude stderr: ${text}`);
       });
 
-      child.on("error", (err) => {
+      child.on("error", (error) => {
         // e.g. ENOENT if the resolved path vanished — log, don't throw.
-        this.logger.error(`[Chorus] claude process error: ${err}`);
+        this.logger.error(`[Chorus] claude process error: ${safeSpawnError(error)}`);
         // backendSessionId is the `--resume` anchor (`id`), NOT observedSessionId:
         // a fork-on-resume claude can emit a new stream session_id, but the daemon
         // resumes and files the transcript under `id`, so `id` is the resumable value.
         resolve({ sessionId: observedSessionId, backendSessionId: id, exitCode: null, isNew });
       });
 
-      child.on("close", (code) => {
+      // Settle on process exit, not only on stdio close: a detached descendant can
+      // inherit the pipes and keep `close` from ever firing (see cli/child-exit.mjs).
+      awaitChildSettled(child, { logger: this.logger, label: "claude" }).then((code) => {
         if (code !== 0) {
           this.logger.warn(`[Chorus] claude exited with code ${code}`);
         }
         // backendSessionId is the `--resume` anchor (`id`), NOT observedSessionId (see
         // the process-error handler above for why the anchor is the resumable value).
-        resolve({ sessionId: observedSessionId, backendSessionId: id, exitCode: code, isNew });
+        const result = { sessionId: observedSessionId, backendSessionId: id, exitCode: code, isNew };
+        if (code !== null && code !== 0 && sessionConflictSeen) {
+          result.failureClassification = SESSION_CONFLICT_FAILURE;
+        }
+        resolve(result);
       });
 
       // Guard against an ASYNC stdin error (EPIPE): if claude exits/closes

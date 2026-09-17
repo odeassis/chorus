@@ -19,6 +19,7 @@ const mockReconcileOffline = vi.fn();
 const mockPublishExecutionChange = vi.fn();
 const mockListVisibleConnectionUuids = vi.fn();
 const mockIsSessionVisibleToCaller = vi.fn();
+const mockListVisibleRunningSessionActivities = vi.fn();
 const mockReconcileOrphanTurns = vi.fn();
 
 vi.mock("@/lib/auth", () => ({
@@ -60,6 +61,9 @@ vi.mock("@/services/daemon-execution.service", () => ({
 // the actual channel string.
 vi.mock("@/services/daemon-session.service", () => ({
   isSessionVisibleToCaller: (...args: unknown[]) => mockIsSessionVisibleToCaller(...args),
+  listVisibleRunningSessionActivities: (...args: unknown[]) =>
+    mockListVisibleRunningSessionActivities(...args),
+  SESSION_ACTIVITY_EVENT_NAME: "session_activity",
   transcriptEventName: (sessionUuid: string) => `transcript:${sessionUuid}`,
   reconcileOrphanTurns: (...args: unknown[]) => mockReconcileOrphanTurns(...args),
 }));
@@ -75,6 +79,8 @@ const connectionUuid = "conn-0000-0000-0000-000000000001";
 const connHandle = { uuid: connectionUuid, connectedAt: new Date("2026-06-15T03:00:00.000Z") };
 
 const agentAuth = { type: "agent", companyUuid, actorUuid, permissions: [] };
+const userUuid = "user-0000-0000-0000-000000000001";
+const userAuth = { type: "user", companyUuid, actorUuid: userUuid, permissions: [] };
 
 function makeRequest(query = "", signal?: AbortSignal): NextRequest {
   const url = `http://localhost:3000/api/events${query ? `?${query}` : ""}`;
@@ -125,6 +131,7 @@ beforeEach(() => {
   mockPublishExecutionChange.mockResolvedValue(undefined);
   // Default: the requested session (when one is given) is visible to the caller.
   mockIsSessionVisibleToCaller.mockResolvedValue(true);
+  mockListVisibleRunningSessionActivities.mockResolvedValue([]);
   mockReconcileOrphanTurns.mockResolvedValue(0);
 });
 
@@ -414,6 +421,133 @@ describe("GET /api/events (execution-state SSE)", () => {
   });
 });
 
+describe("GET /api/events (session activity SSE)", () => {
+  const publishedActivity = {
+    type: "session_started",
+    companyUuid,
+    sessionUuid: "session-a",
+    activityUuid: "turn-a",
+    directIdeaUuid: "idea-a",
+    agentUuid: actorUuid,
+    originConnectionUuid: "conn-a",
+    agentOwnerUuid: userUuid,
+  };
+  const bootstrapActivity = {
+    ...publishedActivity,
+    canOpen: true,
+    agentOwnerUuid: undefined,
+  };
+
+  it("subscribes before querying and replays caller-visible running activities", async () => {
+    mockListVisibleConnectionUuids.mockResolvedValue(["conn-a"]);
+    mockListVisibleRunningSessionActivities.mockImplementation(async () => {
+      expect(
+        mockEventBus.on.mock.calls.some((call) => call[0] === "session_activity"),
+      ).toBe(true);
+      return [bootstrapActivity];
+    });
+
+    const res = await GET(makeRequest("clientType=claude_code"));
+    const { chunks } = await startStream(res);
+
+    expect(mockListVisibleRunningSessionActivities).toHaveBeenCalledWith(agentAuth);
+    expect(chunks.join("")).toContain('"type":"session_started"');
+    expect(chunks.join("")).toContain('"activityUuid":"turn-a"');
+  });
+
+  it("buffers a concurrent end until after snapshot replay so the end wins", async () => {
+    mockListVisibleConnectionUuids.mockResolvedValue(["conn-a"]);
+    let resolveSnapshot!: (events: unknown[]) => void;
+    mockListVisibleRunningSessionActivities.mockReturnValue(
+      new Promise((resolve) => {
+        resolveSnapshot = resolve;
+      }),
+    );
+
+    const res = await GET(makeRequest("clientType=claude_code"));
+    const streamPromise = startStream(res);
+    await flush();
+    const handler = mockEventBus.on.mock.calls.find(
+      (call) => call[0] === "session_activity",
+    )![1] as (event: Record<string, unknown>) => void;
+    handler({ ...publishedActivity, type: "session_ended" });
+    resolveSnapshot([bootstrapActivity]);
+    const { chunks } = await streamPromise;
+    await flush();
+
+    const body = chunks.join("");
+    expect(body.indexOf('"type":"session_started"')).toBeGreaterThan(-1);
+    expect(body.indexOf('"type":"session_ended"')).toBeGreaterThan(
+      body.indexOf('"type":"session_started"'),
+    );
+  });
+
+  it("forwards a user's same-company other-user activity with canOpen false and owned activity with true", async () => {
+    mockGetAuthContext.mockResolvedValue(userAuth);
+    const res = await GET(makeRequest("clientType=claude_code"));
+    const { chunks } = await startStream(res);
+    const handler = mockEventBus.on.mock.calls.find(
+      (call) => call[0] === "session_activity",
+    )![1] as (event: Record<string, unknown>) => void;
+    const before = chunks.length;
+
+    handler({
+      ...publishedActivity,
+      agentUuid: "other-user-agent",
+      agentOwnerUuid: "other-user",
+    });
+    handler(publishedActivity);
+    await flush();
+    expect(chunks.length).toBe(before + 2);
+    const body = chunks.slice(before).join("");
+    expect(body).toContain('"agentUuid":"other-user-agent"');
+    expect(body).toContain('"canOpen":false');
+    expect(body).toContain(`"agentUuid":"${actorUuid}"`);
+    expect(body).toContain('"canOpen":true');
+    expect(body).not.toContain("agentOwnerUuid");
+  });
+
+  it("keeps agent-key subscribers self-only", async () => {
+    const res = await GET(makeRequest("clientType=claude_code"));
+    const { chunks } = await startStream(res);
+    const handler = mockEventBus.on.mock.calls.find(
+      (call) => call[0] === "session_activity",
+    )![1] as (event: Record<string, unknown>) => void;
+    const before = chunks.length;
+
+    handler({ ...publishedActivity, agentUuid: "other-agent" });
+    handler(publishedActivity);
+    await flush();
+    expect(chunks.length).toBe(before + 1);
+    expect(chunks.at(-1)).toContain('"canOpen":true');
+  });
+
+  it("drops cross-company live activity", async () => {
+    mockGetAuthContext.mockResolvedValue(userAuth);
+    const res = await GET(makeRequest("clientType=claude_code"));
+    const { chunks } = await startStream(res);
+    const handler = mockEventBus.on.mock.calls.find(
+      (call) => call[0] === "session_activity",
+    )![1] as (event: Record<string, unknown>) => void;
+    const before = chunks.length;
+    handler({ ...publishedActivity, companyUuid: "other-company" });
+    await flush();
+    expect(chunks.length).toBe(before);
+  });
+
+  it("unsubscribes the activity channel on abort", async () => {
+    const ac = new AbortController();
+    const res = await GET(makeRequest("clientType=claude_code", ac.signal));
+    await startStream(res);
+    ac.abort();
+    await flush();
+    expect(mockEventBus.off).toHaveBeenCalledWith(
+      "session_activity",
+      expect.any(Function),
+    );
+  });
+});
+
 describe("GET /api/events (transcript SSE — open-session subscription)", () => {
   const sessionUuid = "sess-aaaa";
 
@@ -506,5 +640,71 @@ describe("GET /api/events (transcript SSE — open-session subscription)", () =>
 
     const offChannels = mockEventBus.off.mock.calls.map((c) => c[0]);
     expect(offChannels).toContain(`transcript:${sessionUuid}`);
+  });
+});
+
+describe("GET /api/events (browser notification forwarding)", () => {
+  beforeEach(() => {
+    mockGetAuthContext.mockResolvedValue(userAuth);
+    mockParseSelfReport.mockReturnValue(null);
+    mockRegisterConnection.mockResolvedValue(null);
+  });
+
+  it("subscribes only the authenticated browser user's channel and forwards payloads unchanged", async () => {
+    const res = await GET(makeRequest());
+    const { chunks } = await startStream(res);
+    const channel = `notification:user:${userUuid}`;
+    const notificationCall = mockEventBus.on.mock.calls.find(
+      ([candidate]) => candidate === channel,
+    );
+
+    expect(notificationCall).toBeDefined();
+    expect(
+      mockEventBus.on.mock.calls.some(
+        ([candidate]) => candidate === "notification:user:another-user",
+      ),
+    ).toBe(false);
+
+    const payload = {
+      type: "new_notification",
+      notificationUuid: "notification-1",
+      unreadCount: 4,
+      action: "mentioned",
+    };
+    const before = chunks.length;
+    notificationCall![1](payload);
+    await flush();
+
+    expect(chunks).toHaveLength(before + 1);
+    expect(chunks.at(-1)).toBe(`data: ${JSON.stringify(payload)}\n\n`);
+  });
+
+  it("removes the browser notification listener on abort", async () => {
+    const abortController = new AbortController();
+    const res = await GET(makeRequest("", abortController.signal));
+    await startStream(res);
+
+    abortController.abort();
+    await flush();
+
+    expect(mockEventBus.off).toHaveBeenCalledWith(
+      `notification:user:${userUuid}`,
+      expect.any(Function),
+    );
+  });
+
+  it("does not add browser notification forwarding to a registered daemon stream", async () => {
+    mockGetAuthContext.mockResolvedValue(agentAuth);
+    mockParseSelfReport.mockReturnValue({ clientType: "claude_code" });
+    mockRegisterConnection.mockResolvedValue(connHandle);
+
+    const res = await GET(makeRequest("clientType=claude_code"));
+    await startStream(res);
+
+    expect(
+      mockEventBus.on.mock.calls.some(([channel]) =>
+        String(channel).startsWith("notification:"),
+      ),
+    ).toBe(false);
   });
 });

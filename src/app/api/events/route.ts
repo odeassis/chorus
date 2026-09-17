@@ -21,8 +21,12 @@ import {
 } from "@/services/daemon-execution.service";
 import {
   isSessionVisibleToCaller,
+  listVisibleRunningSessionActivities,
   reconcileOrphanTurns,
+  SESSION_ACTIVITY_EVENT_NAME,
   transcriptEventName,
+  type SessionActivityEvent,
+  type PublishedSessionActivityEvent,
   type TranscriptEvent,
 } from "@/services/daemon-session.service";
 import { NextRequest } from "next/server";
@@ -49,6 +53,8 @@ export async function GET(request: NextRequest) {
   // handle gets the full lifecycle as before; a null registration leaves both null.
   const conflict = isConnectionConflict(registration) ? registration : null;
   const conn = isConnectionConflict(registration) ? null : registration;
+  const notificationChannel =
+    !conn && !conflict ? `notification:${auth.type}:${auth.actorUuid}` : null;
 
   // Resolve which daemon connections this caller may see (owner/self scoped) so
   // the stream can forward their per-connection `execution:{uuid}` events. The
@@ -77,7 +83,7 @@ export async function GET(request: NextRequest) {
       : null;
 
   const stream = new ReadableStream({
-    start(controller) {
+    async start(controller) {
       const encoder = new TextEncoder();
 
       const send = (data: string) => {
@@ -126,6 +132,16 @@ export async function GET(request: NextRequest) {
 
       eventBus.on("presence", presenceHandler);
 
+      // Browser notifications share this company-wide dashboard stream. Daemon
+      // clients have a registered connection and keep using the dedicated
+      // /api/events/notifications transport for registration/control/liveness.
+      const notificationHandler = (event: Record<string, unknown>) => {
+        send(`data: ${JSON.stringify(event)}\n\n`);
+      };
+      if (notificationChannel) {
+        eventBus.on(notificationChannel, notificationHandler);
+      }
+
       // Subscribe to per-connection execution-state events for every connection
       // this caller may see. Each event is forwarded tagged with a `type:
       // "execution"` discriminator the client routes on (alongside change +
@@ -141,6 +157,40 @@ export async function GET(request: NextRequest) {
       for (const channel of executionChannels) {
         eventBus.on(channel, executionHandler);
       }
+
+      // Attach the company-wide activity listener BEFORE reading the running-turn
+      // snapshot. Live events that land during the query are buffered and flushed
+      // after replay, so a concurrent end always wins over a stale snapshot row.
+      // Ownership travels only on the process-local event and is projected here
+      // into subscriber-relative `canOpen`; it is never sent over the wire.
+      let activityBootstrapping = true;
+      const bufferedActivityEvents: SessionActivityEvent[] = [];
+      const projectActivity = (
+        event: PublishedSessionActivityEvent,
+      ): SessionActivityEvent | null => {
+        if (event.companyUuid !== auth.companyUuid) return null;
+        if (auth.type === "agent" && event.agentUuid !== auth.actorUuid) {
+          return null;
+        }
+        const { agentOwnerUuid, ...activity } = event;
+        return {
+          ...activity,
+          canOpen:
+            auth.type === "agent"
+              ? event.agentUuid === auth.actorUuid
+              : agentOwnerUuid === auth.actorUuid,
+        };
+      };
+      const sessionActivityHandler = (event: PublishedSessionActivityEvent) => {
+        const projected = projectActivity(event);
+        if (!projected) return;
+        if (activityBootstrapping) {
+          bufferedActivityEvents.push(projected);
+          return;
+        }
+        send(`data: ${JSON.stringify(projected)}\n\n`);
+      };
+      eventBus.on(SESSION_ACTIVITY_EVENT_NAME, sessionActivityHandler);
 
       // Subscribe the OPEN conversation's transcript channel (when one was requested
       // AND verified visible above). Each event is forwarded tagged `type:
@@ -171,9 +221,13 @@ export async function GET(request: NextRequest) {
       request.signal.addEventListener("abort", () => {
         eventBus.off("change", handler);
         eventBus.off("presence", presenceHandler);
+        if (notificationChannel) {
+          eventBus.off(notificationChannel, notificationHandler);
+        }
         for (const channel of executionChannels) {
           eventBus.off(channel, executionHandler);
         }
+        eventBus.off(SESSION_ACTIVITY_EVENT_NAME, sessionActivityHandler);
         if (transcriptChannel) {
           eventBus.off(transcriptChannel, transcriptHandler);
         }
@@ -206,6 +260,17 @@ export async function GET(request: NextRequest) {
           orphanTimer.unref?.();
         }
       });
+
+      const runningActivities =
+        await listVisibleRunningSessionActivities(auth);
+      if (request.signal.aborted) return;
+      for (const event of runningActivities) {
+        send(`data: ${JSON.stringify(event)}\n\n`);
+      }
+      activityBootstrapping = false;
+      for (const event of bufferedActivityEvents) {
+        send(`data: ${JSON.stringify(event)}\n\n`);
+      }
     },
   });
 

@@ -4,7 +4,7 @@ description: Chorus Development workflow — claim tasks, report work, and spawn
 license: AGPL-3.0
 metadata:
   author: chorus
-  version: "0.16.4"
+  version: "0.18.1"
   category: project-management
   mcp_server: chorus
 ---
@@ -118,13 +118,15 @@ Each task and proposal includes a `commentCount` field — use it to decide whic
    chorus_get_documents({ projectUuid: "<project-uuid>" })
    ```
 
-> **Document update flow (OpenSpec mode):** if the originating proposal `description` contains a line `OpenSpec change slug: <slug>`, the project's PRD / tech_design / spec Documents are **mirrors** of files under `openspec/changes/<slug>/`. To update such a Document (e.g. clarify an AC, fix a spec scenario before resubmitting), load the `openspec-aware` skill at `~/.codex/skills/openspec-aware/SKILL.md` and follow §3.8: edit the local `.md` file first, then mirror through the `chorus-mcp-call.sh` wrapper with `json_encode_file` and `chorus_check_response`.
+> **Document update flow (OpenSpec mode):** if the originating proposal `description` contains a line `OpenSpec change slug: <slug>`, the project's PRD / tech_design / spec Documents are **mirrors** of files under `openspec/changes/<slug>/`. To update such a Document (e.g. clarify an AC, fix a spec scenario before resubmitting), load the `openspec-aware` skill at `~/.codex/skills/openspec-aware/SKILL.md` and follow §3.8: edit the local `.md` file first, then mirror it — prefer `chorus mcp call … --arg-file content=<file>`, falling back to the `chorus-mcp-call.sh` wrapper with `json_encode_file` when `chorus` is not on `PATH` — with `chorus_check_response` halting on error.
 >
 > **⛔ Do not** call `chorus_pm_update_document` directly from Codex's MCP harness with a hand-typed `content` field in OpenSpec mode. The local file is the source of truth; agent-typed content drifts and burns tokens (`openspec-aware` §2 Rule 1).
 >
 > When the LAST task of an OpenSpec idea is verified, the plugin's PostToolUse hook injects an archive reminder (`openspec-aware` §3.9) — run `openspec archive <slug> --yes`, then mirror each emitted `openspec/specs/<capability>/spec.md` back via §3.8.
 >
 > In the no-OpenSpec fallback (no slug line, or no `openspec` CLI), edit the Document content directly via the existing MCP tool with no wrapper, no local file step.
+
+> **Document update flow (spec-lite mode):** if the originating proposal `description` contains a locator line `Spec-lite: .chorus/specs/<slug>/<YYYY-MM-DD>-<change-slug>/`, the `prd` / `tech_design` / … Documents are **persistent mirrors** of the Chorus-typed docs in that **dated change folder**. Load the `spec-lite` skill (`~/.codex/skills/spec-lite/SKILL.md`). Locate the dated folder from the locator line (not by title/type). Edit those `<type>.md` files in place and update the capability's durable `.chorus/specs/<slug>/spec.md` in place too — but **`spec.md` is never mirrored** (local only, no ids). Tick `- [ ]` acceptance points, then re-mirror each edited dated-folder file via `chorus mcp call chorus_pm_update_document … --arg-file content=.chorus/specs/<slug>/<YYYY-MM-DD>-<change-slug>/<type>.md` against its `documentUuid` (each update auto-increments the Document version = its modification history; `chorus-mcp-call.sh` fallback when `chorus` not on `PATH`). **Git history is the audit trail** (`git log -- .chorus/specs/<slug>/`; `git log --follow -- <file>` for a single renamed file) — no changelog section.
 
 ### Step 5: Start Working
 
@@ -190,20 +192,20 @@ chorus_submit_for_verify({
 
 > `to_verify` does NOT unblock downstream tasks — only `done` (after admin verification) does.
 
-> **Review Agent:** After `chorus_submit_for_verify`, the Chorus plugin's PostToolUse hook injects context instructing you to spawn the `chorus-task-reviewer` sub-agent. You MUST spawn it yourself (it is NOT auto-launched). Spawn it by mounting this plugin's `chorus-task-reviewer` skill into a default sub-agent:
+> **Review Agent:** After `chorus_submit_for_verify`, the Chorus plugin's PostToolUse hook injects context instructing you to spawn the `chorus-task-reviewer` sub-agent. You MUST spawn it yourself (it is NOT auto-launched). Mount this plugin's `chorus-task-reviewer` skill explicitly:
 >
 > ```
-> spawn_agent(
->   agent_type="default",
->   items=[
+> reviewer = spawn_agent({
+>   items: [
 >     { type: "skill", name: "Chorus Task Reviewer", path: "chorus:chorus-task-reviewer" },
 >     { type: "text",  text: "Review Chorus task <task-uuid>. Post VERDICT comment." }
 >   ]
-> )
-> wait_agent([reviewer_id]); close_agent(reviewer_id)
+> })
+> wait_agent({ targets: [reviewer.agent_id] })
+> close_agent({ target: reviewer.agent_id })
 > ```
 >
-> Why not `agent_type="chorus-task-reviewer"`? Codex 0.125 only has three built-in roles (default / explorer / worker); custom review personas are loaded by mounting the skill. The reviewer posts a `VERDICT:` comment on the task.
+> Verification is blocked on the verdict, so this call site waits. Once the reviewer finishes, close it promptly to release its thread slot. The reviewer posts a `VERDICT:` comment on the task.
 
 > **Final code-review gateway (after the Idea's LAST task is verified):** when the task you just verified is the **last** task of its idea-rooted proposal, the feature is about to ship — the PostToolUse hook injects a reminder to run the ship-time code-review gateway. Spawn it the same way, mounting `chorus:chorus-code-reviewer` and passing the `ideaUuid` + round number; it reviews the Idea's **aggregate** code change (cross-task integration, architecture, security, regression, feature-level coverage) and posts one `VERDICT:` comment on the **idea**. `PASS` / `PASS WITH NOTES` → ship; `FAIL` → fix via the **quick-dev** workflow (`$quick-dev`): `chorus_create_tasks` with `proposalUuid` set to the **current approved proposal** so the fix tasks attach to it (do not reopen old tasks). Group related small BLOCKERs into one cohesive task by default; split only materially large or independently testable fixes. Each fix task must self-check its acceptance criteria and pass independent task review plus admin verification. Re-run the gateway only after every fix task is successfully `done`; if there is a failed or cancelled fix task, stop and escalate instead. Advisory/behavioral, same as the other reviewers. Run it **before** any idea-completion report.
 
@@ -211,13 +213,13 @@ After the reviewer completes, read its VERDICT:
 ```
 chorus_get_comments({ targetType: "task", targetUuid: "<task-uuid>" })
 ```
-Find the most recent comment containing `VERDICT:` and act on it:
+Find THIS round's `VERDICT:` comment — the one posted after your dispatch, not an older round's — and act on it:
 
 - **VERDICT: PASS** — All AC verified, no issues. Proceed to admin verification.
 - **VERDICT: PASS WITH NOTES** — All AC verified, minor notes. Proceed to admin verification (notes are non-blocking).
 - **VERDICT: FAIL** — BLOCKERs found. Do NOT verify. Fix the BLOCKERs listed in the reviewer's comment, then resubmit.
 
-If no new `VERDICT:` comment appears after the reviewer returns, it exhausted its `maxTurns` budget before posting. Respawn it ONCE with a concise-budget hint in the prompt: *"Stay within turn budget. Skip deep verification. Fetch task/proposal/comments, run only the core tests, and post your VERDICT comment within the first 12 turns."* If the second attempt still produces no VERDICT, review manually using the checklist and proceed.
+If no new `VERDICT:` comment appears after the reviewer returns, check what it *did* post. A comment reporting that the round limit was reached, or any other explicit refusal to review, is a deliberate escalation to a human: STOP — do not respawn, do not self-review, do not post a VERDICT of your own. If it posted nothing at all, respawn it ONCE, telling it to stay within its turn budget and reserve its last turns for the VERDICT, then apply this same check again to what the retry posts. An explicit refusal from the retry still means STOP; only a second true silence lets you review the task yourself as a read-only pass using the checklist and POST the VERDICT comment. **Absence is never a PASS.**
 
 ### Step 9: Handle Review Feedback
 
@@ -239,7 +241,7 @@ Once Admin verifies (status: `done`), move to the next available task (back to S
 
 ### Step 11: Idea Completion Report (advisory)
 
-If the task you just self-verified was the LAST one of its Idea (every Task across every approved Proposal is now `done`/`closed`) and you have `document:write`, prompt the user and call `chorus_create_report` on accept. The `content` parameter's description carries the section template. Skip on decline — the PostToolUse hook will remind on the next run.
+If the task you just self-verified was the LAST one of its Idea (every Task across every approved Proposal is now `done`/`closed`) and you have `document:write`, prompt the user and call `chorus_create_report` on accept. The call requires `title` (a short report title) plus `content`; `content`'s parameter description carries the three-section template (`## Summary` / `## Decisions` / `## Follow-ups`). Skip on decline — the PostToolUse hook will remind on the next run.
 
 ---
 
@@ -254,6 +256,8 @@ When running multiple sub-agents in parallel on a proposal's tasks, the main age
 | **Orchestration** | Codex `spawn_agent` | Spawning sub-agents, passing task assignments |
 | **Work Tracking** | Chorus MCP | Task lifecycle and work reports |
 
+Codex owns execution-thread orchestration (`spawn_agent`, `wait_agent`, `send_input`, `close_agent`, `resume_agent`). Chorus MCP remains authoritative for task claims, status, work reports, acceptance evidence, verification submissions, and reviewer comments.
+
 ### Team Lead Workflow
 
 ```
@@ -262,16 +266,27 @@ chorus_checkin()
 chorus_list_tasks({ projectUuid: "<project-uuid>" })
 chorus_get_unblocked_tasks({ projectUuid: "<project-uuid>" })
 
-# 2. Spawn workers and pass task UUIDs in the message
-spawn_agent(
-  agent_type="worker",
-  message='''You are a Chorus developer worker. Follow the $develop skill.
-Your task(s): <task-uuid-1>, <task-uuid-2>
+# 2. Mount the workflow explicitly and pass Chorus entity UUIDs
+worker = spawn_agent({
+  items: [
+    { type: "skill", name: "Chorus Develop", path: "chorus:develop" },
+    { type: "text", text: """Work these Chorus tasks in dependency order:
+Task UUIDs: <task-uuid-1>, <task-uuid-2>
 Project UUID: <project-uuid>
 
-Procedure: for each task — claim → mark in_progress → implement → report work → self-check AC → submit for verification.''',
-)
+For each task: claim → mark in_progress → implement → report work → self-check AC → submit for verification. Exit after submission; the main agent owns independent review and admin verification.""" }
+  ]
+})
 ```
+
+### Context and Lifecycle
+
+- Start routine entity-backed workers and reviewers with a fresh context (the default). They can fetch authoritative context from Chorus using the task, proposal, idea, and project UUIDs in the text item.
+- Set `fork_context: true` only when the child genuinely needs material evidence or decisions from the parent conversation that cannot be conveyed cleanly in the mounted skill plus assignment text. State that reason in the assignment.
+- Call `wait_agent` only when the next orchestrator action is blocked on the result. Independent workers can run while the main agent handles unrelated work.
+- Use `send_input` to clarify, correct, or extend work in an active sub-agent.
+- Call `close_agent` as soon as a completed or abandoned sub-agent needs no further interaction; completion alone does not release its thread slot.
+- Use `resume_agent` only to restore a previously closed sub-agent. For an active sub-agent, use `send_input`.
 
 ### Wave-Based Execution
 
@@ -287,7 +302,7 @@ Procedure: for each task — claim → mark in_progress → implement → report
 
 ### Multiple Tasks Per Worker
 
-A single worker can work on multiple tasks sequentially — write them in its `spawn_agent` message in dependency order, and have the worker loop over them.
+A single worker can work on multiple tasks sequentially — list them in the `spawn_agent` text item in dependency order, and have the worker loop over them.
 
 ### MCP Access for Workers
 

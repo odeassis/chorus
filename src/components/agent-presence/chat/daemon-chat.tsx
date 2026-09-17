@@ -40,6 +40,7 @@ import { useAgentPresence } from "@/contexts/agent-presence-context";
 import type { ExecutionView } from "../types";
 import type { SessionTarget } from "../send-instruction-box";
 import type {
+  AgentSessionIndexEntry,
   SessionDetailView,
   SessionView,
   TranscriptMessageView,
@@ -126,6 +127,23 @@ export function mergeTurnPage(
   return [...byUuid.values()].sort((a, b) => a.seq - b.seq);
 }
 
+// Union two conversation-row lists by session uuid, then sort newest-first by `lastTurnAt`.
+// Used to (a) preserve an optimistically-prepended (just-started) conversation when a fresh
+// server page for its agent lands, (b) fold the 15s poll's refreshed first page into the
+// already-loaded rows WITHOUT dropping older pages a user pulled via "Load more" (the
+// proposal-review note), and (c) append an older "Load more" page. When the same conversation
+// appears on both sides the INCOMING copy wins (it is fresher — newer originOnline / status /
+// lastTurnAt). Returns a NEW array.
+export function mergeSessionsById(
+  incoming: SessionTarget[],
+  existing: SessionTarget[],
+): SessionTarget[] {
+  const byUuid = new Map<string, SessionTarget>();
+  for (const s of existing) byUuid.set(s.uuid, s);
+  for (const s of incoming) byUuid.set(s.uuid, s); // incoming (fresher) wins on a uuid clash
+  return [...byUuid.values()].sort((a, b) => (a.lastTurnAt < b.lastTurnAt ? 1 : -1));
+}
+
 export function applyTranscriptEvent(
   turns: TurnWithMessagesView[],
   event: {
@@ -190,7 +208,7 @@ export function applyTranscriptEvent(
 // "loading"`) where nothing matched and the list fell through to its empty state, reading
 // as "no conversations" while the fetch was still in flight. Gating on `listStatus` closes
 // that window: during first load `listLoading` is true and the list pane renders its
-// skeleton. `fetchSessions` only ever sets `listStatus` to `"ok"` / `"error"` (never back
+// skeleton. `fetchAgentIndex` only ever sets `listStatus` to `"ok"` / `"error"` (never back
 // to `"loading"`), so the 15s background poll never re-raises the skeleton after first load.
 //
 // Precedence (unchanged from before, minus the removed top-level loading text branch):
@@ -231,35 +249,121 @@ export function DaemonChat() {
     clearChatFocusTarget,
   } = useAgentPresence();
 
-  // ===== Conversation list (GET /api/daemon-sessions) =====
+  // ===== Conversation list (server-paginated GET /api/daemon-sessions) =====
+  // The list is paginated per agent (the UI shows one agent at a time). Two reads back it:
+  //   - `?view=agents`  → the AGENT INDEX (cheap grouped aggregate) for the Select + default
+  //     agent. Fetched on mount + a 15s refresh; NO conversation rows.
+  //   - `?agentUuid=&limit=&before=` → one PAGE of the SELECTED agent's conversations. So we
+  //     never fetch more rows than we show (the fix: opening the modal no longer pulls the
+  //     caller's whole history).
+  // `sessions` therefore holds ONLY the SELECTED agent's loaded page(s) (+ live/optimistic
+  // rows), not every session.
+  const [agentIndex, setAgentIndex] = useState<AgentSessionIndexEntry[]>([]);
   const [sessions, setSessions] = useState<SessionTarget[]>([]);
+  // `listStatus` gates the first-load skeleton on the AGENT-INDEX fetch (the modal's first
+  // paint); `pageStatus` covers the selected agent's first PAGE fetch so switching agents
+  // shows a skeleton instead of an empty flash.
   const [listStatus, setListStatus] = useState<"loading" | "ok" | "error">(
     "loading",
   );
-  const fetchSessions = useCallback(async () => {
-    try {
-      const res = await authFetch("/api/daemon-sessions");
-      if (!res.ok) {
+  const [pageStatus, setPageStatus] = useState<"idle" | "loading" | "ok" | "error">(
+    "idle",
+  );
+  // The server keyset cursor for the SELECTED agent's next (older) page + whether more exist.
+  const [listCursor, setListCursor] = useState<string | null>(null);
+  const [listHasMore, setListHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  // Agent-index fetch — coalesced (one in flight per mounted chat) + refreshed every 15s, the
+  // same cadence/coalescing the old full-list fetch used.
+  const agentIndexRequestRef = useRef<Promise<void> | null>(null);
+  const fetchAgentIndex = useCallback((): Promise<void> => {
+    if (agentIndexRequestRef.current) return agentIndexRequestRef.current;
+    const request = (async () => {
+      try {
+        const res = await authFetch("/api/daemon-sessions?view=agents");
+        if (!res.ok) {
+          setListStatus("error");
+          return;
+        }
+        const json = await res.json();
+        if (json.success) {
+          setAgentIndex(json.data.agents ?? []);
+          setListStatus("ok");
+        } else {
+          setListStatus("error");
+        }
+      } catch (error) {
+        clientLogger.error("Failed to fetch daemon agent index:", error);
         setListStatus("error");
-        return;
       }
-      const json = await res.json();
-      if (json.success) {
-        setSessions(json.data.sessions ?? []);
-        setListStatus("ok");
-      } else {
-        setListStatus("error");
+    })();
+    agentIndexRequestRef.current = request;
+    void request.finally(() => {
+      if (agentIndexRequestRef.current === request) {
+        agentIndexRequestRef.current = null;
       }
-    } catch (error) {
-      clientLogger.error("Failed to fetch daemon sessions:", error);
-      setListStatus("error");
-    }
+    });
+    return request;
   }, []);
   useEffect(() => {
-    fetchSessions();
-    const id = setInterval(fetchSessions, 15_000);
+    fetchAgentIndex();
+    const id = setInterval(fetchAgentIndex, 15_000);
     return () => clearInterval(id);
-  }, [fetchSessions]);
+  }, [fetchAgentIndex]);
+
+  // Fetch the SELECTED agent's first page. A selection change bumps `pageReqRef` so a stale
+  // response can't overwrite the new agent's rows; a background merge-refresh (poll) reuses
+  // the current generation so it never invalidates an in-flight "Load more".
+  //  - fresh load (agent switch): MERGE the server page with any existing rows FOR THIS AGENT
+  //    (`prev.filter(agentUuid)`) so a just-started/seeded conversation not yet indexed
+  //    server-side survives, while a genuine switch (prev holds the OTHER agent's rows) is an
+  //    effective replace; reset the cursor to this page's.
+  //  - merge refresh (poll): union the refreshed first page into ALL loaded rows, keeping
+  //    older "Load more" pages, and DO NOT touch the cursor.
+  const pageReqRef = useRef(0);
+  const fetchFirstPage = useCallback(
+    async (agentUuid: string, opts?: { merge?: boolean }): Promise<void> => {
+      const reqId = opts?.merge ? pageReqRef.current : ++pageReqRef.current;
+      if (!opts?.merge) setPageStatus("loading");
+      try {
+        const res = await authFetch(
+          `/api/daemon-sessions?agentUuid=${encodeURIComponent(agentUuid)}&limit=${PAGE_SIZE}`,
+        );
+        if (reqId !== pageReqRef.current) return; // superseded by an agent switch
+        if (!res.ok) {
+          if (!opts?.merge) setPageStatus("error");
+          return;
+        }
+        const json = await res.json();
+        if (reqId !== pageReqRef.current) return;
+        if (json.success) {
+          const data = json.data as {
+            sessions: SessionTarget[];
+            nextCursor: string | null;
+            hasMore: boolean;
+          };
+          const page = data.sessions ?? [];
+          if (opts?.merge) {
+            setSessions((prev) => mergeSessionsById(page, prev));
+          } else {
+            setSessions((prev) =>
+              mergeSessionsById(page, prev.filter((s) => s.agentUuid === agentUuid)),
+            );
+            setListCursor(data.nextCursor);
+            setListHasMore(Boolean(data.hasMore));
+          }
+          setPageStatus("ok");
+        } else if (!opts?.merge) {
+          setPageStatus("error");
+        }
+      } catch (error) {
+        clientLogger.error("Failed to fetch daemon session page:", error);
+        if (!opts?.merge) setPageStatus("error");
+      }
+    },
+    [],
+  );
 
   // ===== Agent axis (agent-first) =====
   // Resolve a display name per agentUuid from the connection list (sessions carry
@@ -274,26 +378,23 @@ export function DaemonChat() {
     }
     const agentUuids = new Set<string>([
       ...connections.map((c) => c.agentUuid),
-      ...sessions.map((s) => s.agentUuid),
+      // Agents with history (possibly disconnected) come from the index, NOT the loaded
+      // per-agent rows — so the Select lists every agent even before its page is fetched.
+      ...agentIndex.map((a) => a.agentUuid),
     ]);
     return [...agentUuids].map((agentUuid) => ({
       agentUuid,
       agentName: names.get(agentUuid) ?? t("roleAgent"),
     }));
-  }, [connections, sessions, t]);
+  }, [connections, agentIndex, t]);
 
   // Default-select the agent with the most recent conversation so the modal never
-  // opens empty. Derived-then-pinned: the explicit selection wins when it still
-  // resolves, otherwise fall back to the most-recent agent.
+  // opens empty. The agent index is server-sorted by max `lastTurnAt` desc, so its first
+  // entry IS the most-recent agent — no row scan needed. Fall back to the first agent
+  // (e.g. a connected agent with no history yet).
   const mostRecentAgentUuid = useMemo(() => {
-    let best: { agentUuid: string; lastTurnAt: string } | null = null;
-    for (const s of sessions) {
-      if (!best || s.lastTurnAt > best.lastTurnAt) {
-        best = { agentUuid: s.agentUuid, lastTurnAt: s.lastTurnAt };
-      }
-    }
-    return best?.agentUuid ?? agents[0]?.agentUuid ?? null;
-  }, [sessions, agents]);
+    return agentIndex[0]?.agentUuid ?? agents[0]?.agentUuid ?? null;
+  }, [agentIndex, agents]);
 
   const [pickedAgentUuid, setPickedAgentUuid] = useState<string | null>(null);
   const selectedAgentUuid =
@@ -379,16 +480,93 @@ export function DaemonChat() {
       }));
   }, [sessions, selectedAgentUuid, executionsByConnection, conversationName]);
 
-  // Client-side pagination — reset to one page when the agent changes.
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  // Load the selected agent's FIRST page whenever the selection changes (server-side
+  // pagination replaces the old client-side slice). Clearing the selection empties the
+  // loaded rows + cursor.
   useEffect(() => {
-    setVisibleCount(PAGE_SIZE);
-  }, [selectedAgentUuid]);
+    if (!selectedAgentUuid) {
+      setSessions([]);
+      setListCursor(null);
+      setListHasMore(false);
+      setPageStatus("idle");
+      return;
+    }
+    fetchFirstPage(selectedAgentUuid);
+  }, [selectedAgentUuid, fetchFirstPage]);
+
+  // Poll ONLY the selected agent's first page every 15s — resettles `originOnline` and
+  // surfaces newly-started conversations at the top, merged (never replacing) so older
+  // "Load more" pages and optimistic rows are preserved. Bounded to one page, never the
+  // whole history.
+  useEffect(() => {
+    if (!selectedAgentUuid) return;
+    const id = setInterval(() => {
+      void fetchFirstPage(selectedAgentUuid, { merge: true });
+    }, 15_000);
+    return () => clearInterval(id);
+  }, [selectedAgentUuid, fetchFirstPage]);
+
+  // "Load more" — fetch the next (older) page via the server `before` cursor and append it,
+  // de-duplicated by uuid. Bound to the current agent generation so an agent switch
+  // mid-flight discards the stale append.
+  const loadMoreSessions = useCallback(async () => {
+    if (!selectedAgentUuid || loadingMore || !listHasMore || !listCursor) return;
+    const reqId = pageReqRef.current;
+    setLoadingMore(true);
+    try {
+      const res = await authFetch(
+        `/api/daemon-sessions?agentUuid=${encodeURIComponent(selectedAgentUuid)}&limit=${PAGE_SIZE}&before=${encodeURIComponent(listCursor)}`,
+      );
+      if (reqId !== pageReqRef.current) return; // agent switched mid-flight
+      if (!res.ok) return; // transient — the control stays available
+      const json = await res.json();
+      if (reqId !== pageReqRef.current) return;
+      if (json.success) {
+        const data = json.data as {
+          sessions: SessionTarget[];
+          nextCursor: string | null;
+          hasMore: boolean;
+        };
+        // Existing rows first (newer), then the older page — mergeSessionsById re-sorts by
+        // lastTurnAt desc and de-dupes by uuid.
+        setSessions((prev) => mergeSessionsById(prev, data.sessions ?? []));
+        setListCursor(data.nextCursor);
+        setListHasMore(Boolean(data.hasMore));
+      }
+    } catch (error) {
+      clientLogger.error("Failed to load more daemon sessions:", error);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [selectedAgentUuid, loadingMore, listHasMore, listCursor]);
 
   // ===== Selected conversation + its transcript (GET /api/daemon-sessions/[uuid]) =====
   const [selectedSessionUuid, setSelectedSessionUuid] = useState<string | null>(
     null,
   );
+  const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
+  // A one-shot focus can identify a conversation outside the selected agent's
+  // first server-paginated page. Keep that UUID while its direct detail read is
+  // in flight so the transcript can open independently of the 12 loaded rows.
+  // Once the detail succeeds it is injected into `sessions`; on failure the
+  // marker lets us safely fall back to the conversation list instead of leaving
+  // a phantom selection or an empty mobile drill-down behind.
+  const focusedSessionUuidRef = useRef<string | null>(null);
+  const focusedSessionNeedsInjectionRef = useRef<string | null>(null);
+  const connectionsRef = useRef(connections);
+  useEffect(() => {
+    connectionsRef.current = connections;
+  }, [connections]);
+  const abandonFocusedSession = useCallback((sessionUuid: string) => {
+    if (focusedSessionUuidRef.current !== sessionUuid) return false;
+    focusedSessionUuidRef.current = null;
+    focusedSessionNeedsInjectionRef.current = null;
+    setSelectedSessionUuid((current) =>
+      current === sessionUuid ? null : current,
+    );
+    setMobileDetailOpen(false);
+    return true;
+  }, []);
   // Resolve the selection: explicit pick wins when it's still in the current agent's
   // rows; otherwise null (the right pane shows the select prompt).
   const selectedSession = useMemo(
@@ -425,7 +603,10 @@ export function DaemonChat() {
   // carries only the turn, not the session, so the rollup would otherwise never update live.
   const rolledUpTurnsRef = useRef<Set<string>>(new Set());
 
-  const openUuid = selectedSession?.session.uuid ?? null;
+  // A direct focus target is authoritative even before its row is present in the
+  // current server page. Driving the detail read from the UUID (rather than the
+  // resolved row) is what lets an older active session open immediately.
+  const openUuid = selectedSessionUuid;
 
   // Tell the provider which session is open so it subscribes that transcript
   // channel; clear on close/unmount.
@@ -464,7 +645,9 @@ export function DaemonChat() {
         const res = await authFetch(`/api/daemon-sessions/${openUuid}`);
         if (reqId !== detailReqRef.current) return; // superseded
         if (!res.ok) {
-          setDetailError(true);
+          if (!abandonFocusedSession(openUuid)) {
+            setDetailError(true);
+          }
           return;
         }
         const json = await res.json();
@@ -472,6 +655,42 @@ export function DaemonChat() {
         if (json.success) {
           const data = json.data as SessionDetailView;
           setDetail(data);
+          if (focusedSessionUuidRef.current === openUuid) {
+            focusedSessionUuidRef.current = null;
+            const needsInjection =
+              focusedSessionNeedsInjectionRef.current === openUuid;
+            focusedSessionNeedsInjectionRef.current = null;
+            const session = data.session;
+            const originOnline = connectionsRef.current.some(
+              (connection) =>
+                connection.uuid === session.originConnectionUuid &&
+                connection.effectiveStatus === "online",
+            );
+            // Preserve bounded server pagination: add only the explicitly-focused
+            // row instead of walking older pages or restoring an all-history read.
+            if (needsInjection) {
+              setSessions((current) =>
+                mergeSessionsById(
+                  [
+                    {
+                      uuid: session.uuid,
+                      agentUuid: session.agentUuid,
+                      sessionId: session.sessionId,
+                      directIdeaUuid: session.directIdeaUuid,
+                      originConnectionUuid: session.originConnectionUuid,
+                      status: session.status,
+                      title: session.title,
+                      lastTurnAt: session.lastTurnAt,
+                      originOnline,
+                      firstInstruction: null,
+                      ideaTitle: null,
+                    },
+                  ],
+                  current,
+                ),
+              );
+            }
+          }
           // The server rollup on `data.session` already accounts for every terminal turn
           // that existed at fetch time — record their uuids so a live terminal event for
           // one of them can't double-count into the local header total (daemon-token-usage).
@@ -494,17 +713,21 @@ export function DaemonChat() {
               : null,
           );
         } else {
-          setDetailError(true);
+          if (!abandonFocusedSession(openUuid)) {
+            setDetailError(true);
+          }
         }
       } catch (error) {
         if (reqId !== detailReqRef.current) return;
         clientLogger.error("Failed to fetch daemon session detail:", error);
-        setDetailError(true);
+        if (!abandonFocusedSession(openUuid)) {
+          setDetailError(true);
+        }
       } finally {
         if (reqId === detailReqRef.current) setDetailLoading(false);
       }
     })();
-  }, [openUuid]);
+  }, [openUuid, abandonFocusedSession]);
 
   // Load the page of MESSAGES older than the loaded window and merge it in. The cursor is
   // the SERVER-RETURNED composite `(oldestTurnSeq, oldestMsgSeq)` of the previous page —
@@ -686,24 +909,29 @@ export function DaemonChat() {
       : "";
 
   // ===== Mobile drill-down =====
-  const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
   useEffect(() => {
     if (
+      listStatus !== "loading" &&
       mobileDetailOpen &&
       selectedSessionUuid &&
+      focusedSessionUuidRef.current !== selectedSessionUuid &&
       !rows.some((r) => r.session.uuid === selectedSessionUuid)
     ) {
       setMobileDetailOpen(false);
     }
-  }, [rows, mobileDetailOpen, selectedSessionUuid]);
+  }, [rows, listStatus, mobileDetailOpen, selectedSessionUuid]);
 
   const selectSession = useCallback((uuid: string) => {
+    focusedSessionUuidRef.current = null;
+    focusedSessionNeedsInjectionRef.current = null;
     setSelectedSessionUuid(uuid);
   }, []);
 
   // "New conversation" — clear the selection so the right pane (desktop) / drill-down
   // (mobile) shows the new-conversation composer instead of a transcript.
   const startNewConversation = useCallback(() => {
+    focusedSessionUuidRef.current = null;
+    focusedSessionNeedsInjectionRef.current = null;
     setSelectedSessionUuid(null);
     setMobileDetailOpen(true);
   }, []);
@@ -730,7 +958,7 @@ export function DaemonChat() {
         // The session is pinned to a connection we just verified online (ad-hoc start) or
         // re-pointed to one (T12 re-point) — either way its origin is online right now.
         originOnline: true,
-        // Naming fields settle on the next fetchSessions() re-sync (the just-sent
+        // Naming fields settle on the next first-page re-sync (the just-sent
         // instruction becomes this conversation's firstInstruction server-side).
         firstInstruction: null,
         ideaTitle: null,
@@ -772,10 +1000,14 @@ export function DaemonChat() {
           : prev,
       );
       setSelectedSessionUuid(created.uuid);
-      // Re-sync from the server in the background (authoritative ordering + fields).
-      fetchSessions();
+      // Refresh the agent index in the background so a brand-new agent (or a shifted
+      // most-recent) settles into the Select. Authoritative row ordering/fields for the
+      // conversation itself come from the selection-change first-page fetch (this created
+      // session's agent gets pinned right after) and the 15s merge-poll; the optimistic
+      // prepend/patch above already shows it immediately.
+      fetchAgentIndex();
     },
-    [fetchSessions],
+    [fetchAgentIndex],
   );
 
   // Consume a one-shot chat focus target: pin the left rail to the focused agent,
@@ -794,32 +1026,54 @@ export function DaemonChat() {
     if (!focusTarget) return;
     setPickedAgentUuid(focusTarget.agentUuid);
     if (focusTarget.sessionSeed) {
+      focusedSessionUuidRef.current = null;
+      focusedSessionNeedsInjectionRef.current = null;
       handleSessionStarted(focusTarget.sessionSeed);
       // The seeded conversation must also open on the MOBILE breakpoint, where a
       // selection only shows once the drill-down is open.
       setMobileDetailOpen(true);
     } else if (focusTarget.sessionUuid) {
-      // Session focus without a seed — select it if/when the list has it.
+      // Session focus without a seed — select it immediately. If it is outside
+      // the current first page, the detail read above resolves it by UUID and
+      // injects that one row without unbounding the paginated list.
+      focusedSessionUuidRef.current = focusTarget.sessionUuid;
+      focusedSessionNeedsInjectionRef.current = sessions.some(
+        (session) => session.uuid === focusTarget.sessionUuid,
+      )
+        ? null
+        : focusTarget.sessionUuid;
       setSelectedSessionUuid(focusTarget.sessionUuid);
       setMobileDetailOpen(true);
     } else {
+      focusedSessionUuidRef.current = null;
+      focusedSessionNeedsInjectionRef.current = null;
       setSelectedSessionUuid(null);
     }
     clearChatFocusTarget();
-  }, [focusTarget, clearChatFocusTarget, handleSessionStarted]);
+  }, [focusTarget, clearChatFocusTarget, handleSessionStarted, sessions]);
 
   // ===== States =====
   // The chat body's card + list-loading flag, derived by the pure `deriveChatBodyState`
   // helper (see its doc for the loading-vs-empty leak this fixes). The list pane shows a
   // skeleton whenever `listLoading` — gated on the LIST fetch status alone, NOT AND-ed with
   // the independently-settling presence `status`, so the empty state never shows mid-load.
+  // Whether the caller has ANY conversation history at all — the sum of the agent index's
+  // per-agent counts (cheap, from the index, NOT the loaded page). Drives the empty /
+  // no-agents states exactly as the old total-session count did, without loading rows.
+  const totalHistorySessions = useMemo(
+    () => agentIndex.reduce((n, a) => n + a.sessionCount, 0),
+    [agentIndex],
+  );
   const { body: bodyState, listLoading } = deriveChatBodyState({
     listStatus,
-    sessionCount: sessions.length,
+    sessionCount: totalHistorySessions,
     agentCount: agents.length,
   });
   const showListError = bodyState === "error";
   const noAgentsAtAll = bodyState === "no-agents";
+  // The conversation list shows its skeleton during the agent-index first load OR while the
+  // selected agent's first page is loading — so switching agents never flashes the empty state.
+  const conversationListLoading = listLoading || pageStatus === "loading";
 
   // The transcript pane is reused on both breakpoints, differing ONLY in the reply
   // composer's action-row geometry: desktop two-pane keeps it inline (actions on the
@@ -862,7 +1116,7 @@ export function DaemonChat() {
   // selected but the drill-down was opened via "New conversation") the composer.
   // The mobile transcript stacks its reply action row beneath the textarea (the
   // narrow drill-down has no room for an inline footer line), per Q4=mobile-syncs.
-  const mobileDrillContent = selectedSession
+  const mobileDrillContent = selectedSessionUuid
     ? renderTranscript("stacked")
     : newConversationPane;
 
@@ -961,9 +1215,10 @@ export function DaemonChat() {
                   setMobileDetailOpen(true);
                 }}
                 onNewConversation={startNewConversation}
-                visibleCount={visibleCount}
-                onLoadMore={() => setVisibleCount((n) => n + PAGE_SIZE)}
-                loading={listLoading}
+                hasMore={listHasMore}
+                loadingMore={loadingMore}
+                onLoadMore={loadMoreSessions}
+                loading={conversationListLoading}
               />
             </div>
 
@@ -981,16 +1236,17 @@ export function DaemonChat() {
                   selectedSessionUuid={selectedSessionUuid}
                   onSelectSession={selectSession}
                   onNewConversation={startNewConversation}
-                  visibleCount={visibleCount}
-                  onLoadMore={() => setVisibleCount((n) => n + PAGE_SIZE)}
-                  loading={listLoading}
+                  hasMore={listHasMore}
+                  loadingMore={loadingMore}
+                  onLoadMore={loadMoreSessions}
+                  loading={conversationListLoading}
                 />
               </div>
 
               {/* Right pane: the selected transcript, or — when nothing is selected —
                   the new-conversation composer (chat-app default), never a dead end. */}
               <Card className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border-border bg-card p-0 shadow-none">
-                {selectedSession ? transcriptPane : newConversationPane}
+                {selectedSessionUuid ? transcriptPane : newConversationPane}
               </Card>
             </div>
           </>

@@ -8,6 +8,7 @@ const mockPrisma = vi.hoisted(() => {
     findUnique: vi.fn(),
     findFirst: vi.fn(),
     findMany: vi.fn(),
+    groupBy: vi.fn(),
     update: vi.fn(),
     updateMany: vi.fn(),
     },
@@ -55,11 +56,11 @@ vi.mock("@/lib/logger", () => ({ default: mockLogger }));
 const mockEventBus = vi.hoisted(() => ({ emit: vi.fn() }));
 vi.mock("@/lib/event-bus", () => ({ eventBus: mockEventBus }));
 
-// Mock lineage.service so resolveDirectIdeaUuid's reuse is asserted in isolation
-// (no idea/task DB walk).
-const mockResolveRootIdea = vi.hoisted(() => vi.fn());
+// daemon-session.service re-exports the canonical DIRECT-idea primitive from
+// lineage.service; mock it so the re-export is asserted in isolation (no DB walk).
+const mockResolveDirectIdeaUuid = vi.hoisted(() => vi.fn());
 vi.mock("@/services/lineage.service", () => ({
-  resolveRootIdea: mockResolveRootIdea,
+  resolveDirectIdeaUuid: mockResolveDirectIdeaUuid,
 }));
 
 // Mock the connection registry module so importing STALE_THRESHOLD_MS does not pull
@@ -83,12 +84,18 @@ import {
   findReusablePendingInstructionTurn,
   advanceTurn,
   getVisibleSessions,
+  getVisibleAgentIndex,
+  getSessionsPageForAgent,
+  DEFAULT_SESSION_PAGE,
+  MAX_SESSION_PAGE,
+  listVisibleRunningSessionActivities,
   getSessionTurns,
   getSessionDetail,
   isSessionVisibleToCaller,
   assertContinuable,
   appendTranscriptMessages,
   advanceTurnForWake,
+  resolveControlSessionId,
   getPendingTurnsForConnection,
   reconcileOrphanTurns,
   SessionReadOnlyError,
@@ -108,7 +115,9 @@ const turnUuid = "turn-0000-0000-0000-000000000001";
 function sessionRow(overrides: Partial<Record<string, unknown>> = {}) {
   return {
     uuid: sessionUuid,
+    companyUuid,
     agentUuid,
+    agent: { ownerUuid },
     sessionId,
     backendSessionId: null,
     directIdeaUuid: sessionId,
@@ -183,7 +192,7 @@ beforeEach(() => {
   mockPrisma.daemonTranscriptMessage.deleteMany.mockResolvedValue({ count: 0 });
   mockPrisma.daemonConnection.findFirst.mockResolvedValue(null);
   transcriptSeqCounter = 0;
-  mockResolveRootIdea.mockResolvedValue({ rootIdeaUuid: null, directIdeaUuid: null, lineage: [], resolvedVia: "not_found" });
+  mockResolveDirectIdeaUuid.mockResolvedValue(null);
 });
 
 // ===== Constants =====
@@ -351,32 +360,24 @@ describe("resolveOrCreateSession", () => {
   });
 });
 
-// ===== resolveDirectIdeaUuid (lineage reuse) =====
-describe("resolveDirectIdeaUuid", () => {
-  it("delegates to lineage.service.resolveRootIdea and returns its directIdeaUuid", async () => {
-    mockResolveRootIdea.mockResolvedValue({
-      rootIdeaUuid: "root-i",
-      directIdeaUuid: "direct-i",
-      lineage: [],
-      resolvedVia: "via_proposal",
-    });
+// ===== resolveDirectIdeaUuid (re-export of the canonical lineage primitive) =====
+// The no-ancestry-climb behavior itself is verified against the REAL resolver in
+// lineage.service.test.ts; here we only assert the re-export forwards faithfully.
+describe("resolveDirectIdeaUuid (re-export)", () => {
+  it("forwards to lineage.service.resolveDirectIdeaUuid and returns its result", async () => {
+    mockResolveDirectIdeaUuid.mockResolvedValue("direct-i");
     const result = await resolveDirectIdeaUuid(companyUuid, "task", "task-1");
-    expect(mockResolveRootIdea).toHaveBeenCalledWith(companyUuid, "task", "task-1");
+    expect(mockResolveDirectIdeaUuid).toHaveBeenCalledWith(companyUuid, "task", "task-1");
     expect(result).toBe("direct-i");
   });
 
-  it("returns null when the entity has no idea ancestor (a success, not an error)", async () => {
-    mockResolveRootIdea.mockResolvedValue({
-      rootIdeaUuid: null,
-      directIdeaUuid: null,
-      lineage: [],
-      resolvedVia: "no_proposal",
-    });
+  it("returns null when the entity has no idea anchor (a success, not an error)", async () => {
+    mockResolveDirectIdeaUuid.mockResolvedValue(null);
     await expect(resolveDirectIdeaUuid(companyUuid, "task", "task-1")).resolves.toBeNull();
   });
 
   it("PROPAGATES a lineage query failure", async () => {
-    mockResolveRootIdea.mockRejectedValue(new Error("db down"));
+    mockResolveDirectIdeaUuid.mockRejectedValue(new Error("db down"));
     await expect(resolveDirectIdeaUuid(companyUuid, "task", "task-1")).rejects.toThrow("db down");
   });
 });
@@ -536,7 +537,9 @@ describe("advanceTurn", () => {
     mockPrisma.daemonSessionTurn.update.mockResolvedValue(
       turnRow({ status: "interrupted", interruptedReason: "shutdown", endedAt }),
     );
-    mockPrisma.daemonSession.findUnique.mockResolvedValue({ companyUuid });
+    mockPrisma.daemonSession.findUnique.mockResolvedValue(
+      sessionRow(),
+    );
 
     const res = await advanceTurn(turnUuid, "interrupted", {
       endedAt,
@@ -549,12 +552,25 @@ describe("advanceTurn", () => {
     expect(data.endedAt).toBe(endedAt);
 
     // The SSE trigger fires exactly as for ended, carrying the reason in the view.
-    expect(mockEventBus.emit).toHaveBeenCalledTimes(1);
+    expect(mockEventBus.emit).toHaveBeenCalledTimes(2);
     const [eventName, payload] = mockEventBus.emit.mock.calls[0];
     expect(eventName).toBe(`transcript:${sessionUuid}`);
     expect(payload.trigger).toBe("turn_status_changed");
     expect(payload.turn.status).toBe("interrupted");
     expect(payload.turn.interruptedReason).toBe("shutdown");
+    expect(mockEventBus.emit.mock.calls[1]).toEqual([
+      "session_activity",
+      {
+        type: "session_ended",
+        companyUuid,
+        sessionUuid,
+        activityUuid: turnUuid,
+        directIdeaUuid: sessionId,
+        agentUuid,
+        originConnectionUuid: connectionUuid,
+        agentOwnerUuid: ownerUuid,
+      },
+    ]);
   });
 
   it("REJECTS pending → interrupted (a pending turn stays recoverable via backfill)", async () => {
@@ -617,7 +633,7 @@ describe("advanceTurn", () => {
       status: "running",
     });
     mockPrisma.daemonSessionTurn.update.mockResolvedValue(turnRow({ status: "ended" }));
-    mockPrisma.daemonSession.findUnique.mockResolvedValue({ companyUuid });
+    mockPrisma.daemonSession.findUnique.mockResolvedValue(sessionRow());
     // A stray reason alongside a legal → ended must not decorate the ended turn.
     await advanceTurn(turnUuid, "ended", { interruptedReason: "crash" });
     const data = mockPrisma.daemonSessionTurn.update.mock.calls[0][0].data;
@@ -634,7 +650,7 @@ describe("advanceTurn", () => {
     mockPrisma.daemonSessionTurn.update.mockResolvedValue(
       turnRow({ status: "ended", relayError: "transcript upload returned 502" }),
     );
-    mockPrisma.daemonSession.findUnique.mockResolvedValue({ companyUuid });
+    mockPrisma.daemonSession.findUnique.mockResolvedValue(sessionRow());
 
     const res = await advanceTurn(turnUuid, "ended", {
       relayError: "transcript upload returned 502",
@@ -798,7 +814,7 @@ describe("advanceTurn", () => {
     mockPrisma.daemonSessionTurn.update.mockResolvedValue(
       turnRow({ status: "running", startedAt, executionUuid: "exec-1" }),
     );
-    mockPrisma.daemonSession.findUnique.mockResolvedValue({ companyUuid });
+    mockPrisma.daemonSession.findUnique.mockResolvedValue(sessionRow());
 
     const res = await advanceTurn(turnUuid, "running", { startedAt, executionUuid: "exec-1" });
     expect(res).toMatchObject({ ok: true });
@@ -808,7 +824,7 @@ describe("advanceTurn", () => {
     expect(updateArg.data.startedAt).toBe(startedAt);
     expect(updateArg.data.executionUuid).toBe("exec-1");
 
-    expect(mockEventBus.emit).toHaveBeenCalledTimes(1);
+    expect(mockEventBus.emit).toHaveBeenCalledTimes(2);
     const [eventName, payload] = mockEventBus.emit.mock.calls[0];
     expect(eventName).toBe(`transcript:${sessionUuid}`);
     expect(payload.trigger).toBe("turn_status_changed");
@@ -816,6 +832,19 @@ describe("advanceTurn", () => {
     expect(payload.turn.status).toBe("running");
     // No messages changed on a status transition — the tail is always present, empty.
     expect(payload.messages).toEqual([]);
+    expect(mockEventBus.emit.mock.calls[1]).toEqual([
+      "session_activity",
+      {
+        type: "session_started",
+        companyUuid,
+        sessionUuid,
+        activityUuid: turnUuid,
+        directIdeaUuid: sessionId,
+        agentUuid,
+        originConnectionUuid: connectionUuid,
+        agentOwnerUuid: ownerUuid,
+      },
+    ]);
   });
 
   it("running → ended: updates status, records endedAt, emits turn_status_changed", async () => {
@@ -973,6 +1002,218 @@ describe("getVisibleSessions", () => {
       getVisibleSessions({ type: "user", companyUuid, actorUuid: ownerUuid }),
     ).rejects.toThrow("db down");
     expect(mockLogger.error).not.toHaveBeenCalled();
+  });
+});
+
+// ===== getVisibleAgentIndex (agent-index mode — grouped aggregate, no enrichment) =====
+const agentUuid2 = "agent-0000-0000-0000-000000000002";
+describe("getVisibleAgentIndex", () => {
+  it("groups by agentUuid with count + max(lastTurnAt), owner+company scoped, newest agent first, no reconcile", async () => {
+    mockPrisma.daemonSession.groupBy.mockResolvedValue([
+      { agentUuid, _count: { _all: 3 }, _max: { lastTurnAt: new Date("2026-06-15T05:00:00.000Z") } },
+      { agentUuid: agentUuid2, _count: { _all: 1 }, _max: { lastTurnAt: new Date("2026-06-15T02:00:00.000Z") } },
+    ]);
+    const result = await getVisibleAgentIndex({ type: "user", companyUuid, actorUuid: ownerUuid });
+    const arg = mockPrisma.daemonSession.groupBy.mock.calls[0][0];
+    expect(arg.by).toEqual(["agentUuid"]);
+    expect(arg.where).toEqual({ companyUuid, agent: { ownerUuid } });
+    expect(arg._count).toEqual({ _all: true });
+    expect(arg._max).toEqual({ lastTurnAt: true });
+    expect(arg.orderBy).toEqual({ _max: { lastTurnAt: "desc" } });
+    expect(result).toEqual([
+      { agentUuid, lastTurnAt: "2026-06-15T05:00:00.000Z", sessionCount: 3 },
+      { agentUuid: agentUuid2, lastTurnAt: "2026-06-15T02:00:00.000Z", sessionCount: 1 },
+    ]);
+    // Agent-index mode does NO orphan-turn reconcile (that probe query never runs).
+    expect(mockPrisma.daemonSessionTurn.findMany).not.toHaveBeenCalled();
+  });
+
+  it("AGENT-KEY caller is self-scoped via agentUuid", async () => {
+    mockPrisma.daemonSession.groupBy.mockResolvedValue([]);
+    await getVisibleAgentIndex({ type: "agent", companyUuid, actorUuid: agentUuid });
+    expect(mockPrisma.daemonSession.groupBy.mock.calls[0][0].where).toEqual({
+      companyUuid,
+      agentUuid,
+    });
+  });
+
+  it("PROPAGATES a query error (read, does NOT swallow)", async () => {
+    mockPrisma.daemonSession.groupBy.mockRejectedValue(new Error("db down"));
+    await expect(
+      getVisibleAgentIndex({ type: "user", companyUuid, actorUuid: ownerUuid }),
+    ).rejects.toThrow("db down");
+  });
+});
+
+// ===== getSessionsPageForAgent (per-agent keyset page) =====
+describe("getSessionsPageForAgent", () => {
+  it("first page (no cursor): default limit, newest-first, take=limit+1, narrowed to the agent + owner scope", async () => {
+    mockPrisma.daemonSession.findMany.mockResolvedValue([sessionRow()]);
+    const page = await getSessionsPageForAgent(
+      { type: "user", companyUuid, actorUuid: ownerUuid },
+      agentUuid,
+    );
+    const arg = mockPrisma.daemonSession.findMany.mock.calls[0][0];
+    expect(arg.where).toEqual({ companyUuid, agent: { ownerUuid }, agentUuid });
+    expect(arg.orderBy).toEqual([{ lastTurnAt: "desc" }, { uuid: "desc" }]);
+    expect(arg.take).toBe(DEFAULT_SESSION_PAGE + 1);
+    expect(arg.cursor).toBeUndefined();
+    expect(arg.skip).toBeUndefined();
+    expect(page.sessions).toHaveLength(1);
+    expect(page.hasMore).toBe(false);
+    expect(page.nextCursor).toBeNull();
+  });
+
+  it("hasMore + nextCursor when the +1 sentinel row is returned (page trimmed to limit)", async () => {
+    const rows = Array.from({ length: 3 }, (_, i) =>
+      sessionRow({ uuid: `sess-page-${i}` }),
+    );
+    mockPrisma.daemonSession.findMany.mockResolvedValue(rows);
+    const page = await getSessionsPageForAgent(
+      { type: "user", companyUuid, actorUuid: ownerUuid },
+      agentUuid,
+      { limit: 2 },
+    );
+    expect(mockPrisma.daemonSession.findMany.mock.calls[0][0].take).toBe(3);
+    expect(page.sessions.map((s) => s.uuid)).toEqual(["sess-page-0", "sess-page-1"]);
+    expect(page.hasMore).toBe(true);
+    expect(page.nextCursor).toBe("sess-page-1"); // last row OF THE PAGE, not the sentinel
+  });
+
+  it("clamps limit to 1..MAX_SESSION_PAGE and floors/ignores garbage", async () => {
+    mockPrisma.daemonSession.findMany.mockResolvedValue([]);
+    const auth = { type: "user", companyUuid, actorUuid: ownerUuid };
+    await getSessionsPageForAgent(auth, agentUuid, { limit: 9999 });
+    expect(mockPrisma.daemonSession.findMany.mock.calls[0][0].take).toBe(MAX_SESSION_PAGE + 1);
+    await getSessionsPageForAgent(auth, agentUuid, { limit: 0 });
+    expect(mockPrisma.daemonSession.findMany.mock.calls[1][0].take).toBe(1 + 1);
+    await getSessionsPageForAgent(auth, agentUuid, { limit: NaN });
+    expect(mockPrisma.daemonSession.findMany.mock.calls[2][0].take).toBe(DEFAULT_SESSION_PAGE + 1);
+  });
+
+  it("passes the keyset cursor (cursor:{uuid} + skip:1) when `before` is set", async () => {
+    mockPrisma.daemonSession.findMany.mockResolvedValue([]);
+    await getSessionsPageForAgent(
+      { type: "user", companyUuid, actorUuid: ownerUuid },
+      agentUuid,
+      { before: "sess-cursor-xyz" },
+    );
+    const arg = mockPrisma.daemonSession.findMany.mock.calls[0][0];
+    expect(arg.cursor).toEqual({ uuid: "sess-cursor-xyz" });
+    expect(arg.skip).toBe(1);
+  });
+
+  it("AGENT-KEY caller paging ANOTHER agent → empty page, NO query (non-disclosure)", async () => {
+    const page = await getSessionsPageForAgent(
+      { type: "agent", companyUuid, actorUuid: agentUuid },
+      agentUuid2,
+    );
+    expect(page).toEqual({ sessions: [], nextCursor: null, hasMore: false });
+    expect(mockPrisma.daemonSession.findMany).not.toHaveBeenCalled();
+  });
+
+  it("AGENT-KEY caller paging ITS OWN agent → self-scoped where (no key collision)", async () => {
+    mockPrisma.daemonSession.findMany.mockResolvedValue([]);
+    await getSessionsPageForAgent(
+      { type: "agent", companyUuid, actorUuid: agentUuid },
+      agentUuid,
+    );
+    expect(mockPrisma.daemonSession.findMany.mock.calls[0][0].where).toEqual({
+      companyUuid,
+      agentUuid,
+    });
+  });
+});
+
+describe("listVisibleRunningSessionActivities", () => {
+  it("queries all same-company running turns and projects subscriber-relative canOpen", async () => {
+    mockPrisma.daemonSessionTurn.findMany.mockResolvedValue([
+      {
+        uuid: turnUuid,
+        sessionUuid,
+        session: {
+          companyUuid,
+          directIdeaUuid: sessionId,
+          agentUuid,
+          originConnectionUuid: connectionUuid,
+          agent: { ownerUuid },
+        },
+      },
+      {
+        uuid: "other-turn",
+        sessionUuid: "other-session",
+        session: {
+          companyUuid,
+          directIdeaUuid: "other-idea",
+          agentUuid: "other-agent",
+          originConnectionUuid: "other-connection",
+          agent: { ownerUuid: "other-owner" },
+        },
+      },
+    ]);
+
+    const result = await listVisibleRunningSessionActivities({
+      type: "user",
+      companyUuid,
+      actorUuid: ownerUuid,
+    });
+
+    expect(mockPrisma.daemonSessionTurn.findMany).toHaveBeenCalledWith({
+      where: {
+        status: "running",
+        session: {
+          companyUuid,
+        },
+      },
+      orderBy: [{ sessionUuid: "asc" }, { uuid: "asc" }],
+      select: {
+        uuid: true,
+        sessionUuid: true,
+        session: {
+          select: {
+            companyUuid: true,
+            directIdeaUuid: true,
+            agentUuid: true,
+            originConnectionUuid: true,
+            agent: { select: { ownerUuid: true } },
+          },
+        },
+      },
+    });
+    expect(result).toEqual([
+      {
+        type: "session_started",
+        companyUuid,
+        sessionUuid,
+        activityUuid: turnUuid,
+        directIdeaUuid: sessionId,
+        agentUuid,
+        originConnectionUuid: connectionUuid,
+        canOpen: true,
+      },
+      {
+        type: "session_started",
+        companyUuid,
+        sessionUuid: "other-session",
+        activityUuid: "other-turn",
+        directIdeaUuid: "other-idea",
+        agentUuid: "other-agent",
+        originConnectionUuid: "other-connection",
+        canOpen: false,
+      },
+    ]);
+  });
+
+  it("uses self scope for agent callers", async () => {
+    mockPrisma.daemonSessionTurn.findMany.mockResolvedValue([]);
+    await listVisibleRunningSessionActivities({
+      type: "agent",
+      companyUuid,
+      actorUuid: agentUuid,
+    });
+    expect(
+      mockPrisma.daemonSessionTurn.findMany.mock.calls[0][0].where.session,
+    ).toEqual({ companyUuid, agentUuid });
   });
 });
 
@@ -1193,13 +1434,13 @@ describe("getSessionDetail", () => {
       where: { turnUuid: { in: ["t3", "t2", "t1"] } },
       orderBy: [{ turnUuid: "asc" }, { seq: "asc" }],
     });
-    // Candidate turns are read seq DESC; with NO cursor there is no take cap (the page
-    // window is computed in memory over the message stream) and no seq filter. The
-    // candidate query is the LAST turn findMany (the read-time orphan-reconcile probe
+    // Candidate turns are read seq DESC with a fixed default-page bound and no seq filter.
+    // The candidate query is the LAST turn findMany (the read-time orphan-reconcile probe
     // runs first on this path).
     const turnArgs = mockPrisma.daemonSessionTurn.findMany.mock.calls.at(-1)![0];
     expect(turnArgs.orderBy).toEqual({ seq: "desc" });
     expect(turnArgs.where).toEqual({ sessionUuid });
+    expect(turnArgs.take).toBe(DEFAULT_TRANSCRIPT_MESSAGE_PAGE + 2);
   });
 
   it("DEFAULT page size is DEFAULT_TRANSCRIPT_MESSAGE_PAGE (20) MESSAGES, not turns", async () => {
@@ -1247,6 +1488,7 @@ describe("getSessionDetail", () => {
     // limit clamped to 1 → exactly the single newest message (seq 3), hasMore true.
     expect(clampedLow?.turns[0].messages.map((m) => m.seq)).toEqual([3]);
     expect(clampedLow?.hasMore).toBe(true);
+    expect(mockPrisma.daemonSessionTurn.findMany.mock.calls.at(-1)![0].take).toBe(3);
 
     // limit 9999 clamps to 200 (a no-op ceiling here) → the whole conversation fits.
     const clampedHigh = await getSessionDetail(
@@ -1256,6 +1498,7 @@ describe("getSessionDetail", () => {
     );
     expect(clampedHigh?.turns[0].messages.map((m) => m.seq)).toEqual([1, 2, 3]);
     expect(clampedHigh?.hasMore).toBe(false);
+    expect(mockPrisma.daemonSessionTurn.findMany.mock.calls.at(-1)![0].take).toBe(202);
   });
 
   it("COMPOSITE CURSOR: candidate turns fenced seq <= beforeTurnSeq; messages strictly older than (T, M)", async () => {
@@ -1286,6 +1529,7 @@ describe("getSessionDetail", () => {
     // findMany (the read-time orphan-reconcile probe runs first on this path).
     const turnArgs = mockPrisma.daemonSessionTurn.findMany.mock.calls.at(-1)![0];
     expect(turnArgs.where).toEqual({ sessionUuid, seq: { lte: 3 } });
+    expect(turnArgs.take).toBe(52);
     // Only messages strictly older than (turnSeq 3, msgSeq 2): t3's seq 1 (and its slot
     // seq 0), plus all of t2 and t1's slots. t3's seq 2 and 3 are at/after the cursor →
     // excluded. So t3 keeps only t3m1.
@@ -1515,6 +1759,10 @@ describe("getSessionDetail", () => {
       sessionUuid,
       { limit: 1, beforeTurnSeq: page1!.oldestTurnSeq!, beforeMsgSeq: page1!.oldestMsgSeq! },
     );
+    expect(mockPrisma.daemonSessionTurn.findMany.mock.calls.at(-1)![0]).toMatchObject({
+      where: { sessionUuid, seq: { lte: 2 } },
+      take: 3,
+    });
     expect(page2?.turns.map((t) => t.uuid)).toEqual(["t1"]);
     expect(page2?.turns[0].messages).toEqual([]);
     expect(page2?.hasMore).toBe(false); // conversation start reached
@@ -2032,6 +2280,111 @@ describe("appendTranscriptMessages", () => {
   });
 });
 
+// ===== resolveControlSessionId (control key → session business key) =====
+//
+// The control route has an ENTITY key, not a session id. `sessionId === entityUuid` holds
+// for a modern idea-anchored session and for an ad-hoc `daemon_session`, but a LEGACY
+// residual session's key is `${ideaUuid}::${connectionUuid}` and the client heals the `::`
+// away — so both shapes arrive as `idea:<ideaUuid>`. Settling the raw entityUuid could clear
+// an unrelated modern session that merely shares the idea uuid.
+describe("resolveControlSessionId", () => {
+  const args = {
+    companyUuid,
+    agentUuid,
+    connectionUuid,
+    entityUuid: "idea-A",
+  };
+
+  it("considers the exact key AND legacy `entityUuid::` keys on the TARGET connection only", async () => {
+    mockPrisma.daemonSession.findMany.mockResolvedValue([]);
+
+    await resolveControlSessionId(args);
+
+    expect(mockPrisma.daemonSession.findMany.mock.calls[0][0].where).toEqual({
+      companyUuid,
+      agentUuid,
+      OR: [
+        { sessionId: "idea-A" },
+        {
+          sessionId: { startsWith: "idea-A::" },
+          originConnectionUuid: connectionUuid,
+        },
+      ],
+    });
+  });
+
+  it("returns the single candidate's business key (modern shape → identity)", async () => {
+    mockPrisma.daemonSession.findMany.mockResolvedValue([
+      { uuid: "s-1", sessionId: "idea-A" },
+    ]);
+
+    expect(await resolveControlSessionId(args)).toEqual({
+      sessionId: "idea-A",
+      ambiguous: false,
+    });
+    // One candidate needs no turn evidence at all.
+    expect(mockPrisma.daemonSessionTurn.findMany).not.toHaveBeenCalled();
+  });
+
+  it("returns the LEGACY key when that is the only candidate", async () => {
+    mockPrisma.daemonSession.findMany.mockResolvedValue([
+      { uuid: "s-legacy", sessionId: `idea-A::${connectionUuid}` },
+    ]);
+
+    expect(await resolveControlSessionId(args)).toEqual({
+      sessionId: `idea-A::${connectionUuid}`,
+      ambiguous: false,
+    });
+  });
+
+  it("with two candidates, picks the one that actually holds a running turn", async () => {
+    mockPrisma.daemonSession.findMany.mockResolvedValue([
+      { uuid: "s-modern", sessionId: "idea-A" },
+      { uuid: "s-legacy", sessionId: `idea-A::${connectionUuid}` },
+    ]);
+    mockPrisma.daemonSessionTurn.findMany.mockResolvedValue([{ sessionUuid: "s-legacy" }]);
+
+    expect(await resolveControlSessionId(args)).toEqual({
+      sessionId: `idea-A::${connectionUuid}`,
+      ambiguous: false,
+    });
+  });
+
+  it("refuses (null, ambiguous) when BOTH candidates hold a running turn", async () => {
+    mockPrisma.daemonSession.findMany.mockResolvedValue([
+      { uuid: "s-modern", sessionId: "idea-A" },
+      { uuid: "s-legacy", sessionId: `idea-A::${connectionUuid}` },
+    ]);
+    mockPrisma.daemonSessionTurn.findMany.mockResolvedValue([
+      { sessionUuid: "s-modern" },
+      { sessionUuid: "s-legacy" },
+    ]);
+
+    expect(await resolveControlSessionId(args)).toEqual({
+      sessionId: null,
+      ambiguous: true,
+    });
+  });
+
+  it("returns null when no candidate holds a running turn, and when there is no candidate", async () => {
+    mockPrisma.daemonSession.findMany.mockResolvedValue([
+      { uuid: "s-modern", sessionId: "idea-A" },
+      { uuid: "s-legacy", sessionId: `idea-A::${connectionUuid}` },
+    ]);
+    mockPrisma.daemonSessionTurn.findMany.mockResolvedValue([]);
+    expect(await resolveControlSessionId(args)).toEqual({
+      sessionId: null,
+      ambiguous: false,
+    });
+
+    mockPrisma.daemonSession.findMany.mockResolvedValue([]);
+    expect(await resolveControlSessionId(args)).toEqual({
+      sessionId: null,
+      ambiguous: false,
+    });
+  });
+});
+
 // ===== advanceTurnForWake (daemon → server, by session business key) =====
 describe("advanceTurnForWake", () => {
   // Resolve the agent's own session, then the turn matching the FROM-status (pending for
@@ -2260,7 +2613,90 @@ describe("advanceTurnForWake", () => {
     expect(mockPrisma.$transaction).not.toHaveBeenCalled();
   });
 
-  it("deduplicates concurrent identical terminal reports to one rollup and one SSE event", async () => {
+  // The daemon's bounded retry on the terminal turn-advance edge (fix-phantom-running-turn)
+  // needs NO server-side dedupe code — these two tests pin the property it relies on.
+  it("RETRY IDEMPOTENCE: a correlated terminal replay publishes no turn-status event and writes no timestamps or usage", async () => {
+    mockPrisma.daemonSession.findFirst.mockResolvedValue({ uuid: sessionUuid });
+    const endedAt = new Date("2026-01-01T00:00:00.000Z");
+    mockPrisma.daemonSessionTurn.findFirst.mockResolvedValue(
+      turnRow({
+        status: "ended",
+        backendSessionId: "thread-1",
+        endedAt,
+        usage: { inputTokens: 10, outputTokens: 20 },
+      }),
+    );
+
+    // The retry repeats the ORIGINAL report verbatim: same turnUuid, same terminal
+    // status, same usage — exactly what a lost-response retry looks like on the wire.
+    const replay = () =>
+      advanceTurnForWake({
+        companyUuid,
+        agentUuid,
+        connectionUuid,
+        sessionId,
+        turnUuid,
+        backendSessionId: "thread-1",
+        status: "ended" as const,
+        usage: {
+          inputTokens: 10,
+          outputTokens: 20,
+          cacheCreationTokens: null,
+          cacheReadTokens: null,
+          model: "m",
+          source: "dsh" as const,
+        },
+      });
+
+    const res = await replay();
+
+    // The caller gets the EXISTING projection (so the daemon sees its 2xx and stops).
+    expect(res).toMatchObject({
+      ok: true,
+      turn: { uuid: turnUuid, status: "ended", endedAt: endedAt.toISOString() },
+    });
+    // No second usage rollup, no second timestamp write…
+    expect(mockPrisma.daemonSessionTurn.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.daemonSessionTurn.update).not.toHaveBeenCalled();
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    expect(mockPrisma.daemonSession.update).not.toHaveBeenCalled();
+    // …and no turn-status event, so the UI is not told twice that the turn ended.
+    expect(mockEventBus.emit).not.toHaveBeenCalled();
+
+    // Any number of further retries stays a no-op.
+    await replay();
+    await replay();
+    expect(mockPrisma.daemonSessionTurn.updateMany).not.toHaveBeenCalled();
+    expect(mockEventBus.emit).not.toHaveBeenCalled();
+  });
+
+  it("RETRY IDEMPOTENCE: an UNCORRELATED terminal replay finds no running turn → not_found, changing nothing", async () => {
+    // An older daemon omits turnUuid, so the retry resolves by FIFO status. The lost-but-
+    // applied first attempt already left no `running` turn, so there is nothing to hit.
+    mockPrisma.daemonSession.findFirst.mockResolvedValue({ uuid: sessionUuid });
+    mockPrisma.daemonSessionTurn.findFirst.mockResolvedValue(null);
+
+    const res = await advanceTurnForWake({
+      companyUuid,
+      agentUuid,
+      connectionUuid,
+      sessionId,
+      status: "ended",
+    });
+
+    expect(res).toEqual({ ok: false, reason: "not_found" });
+    expect(mockPrisma.daemonSessionTurn.findFirst).toHaveBeenCalledWith({
+      where: { sessionUuid, status: "running" },
+      orderBy: { seq: "asc" },
+    });
+    expect(mockPrisma.daemonSessionTurn.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.daemonSessionTurn.update).not.toHaveBeenCalled();
+    expect(mockPrisma.daemonSession.update).not.toHaveBeenCalled();
+    expect(mockPrisma.daemonSession.updateMany).not.toHaveBeenCalled();
+    expect(mockEventBus.emit).not.toHaveBeenCalled();
+  });
+
+  it("deduplicates concurrent identical terminal reports to one rollup and one lifecycle event pair", async () => {
     let persistedStatus = "running";
     let persistedBackendSessionId: string | null = null;
     let persistedUsage: unknown = null;
@@ -2347,7 +2783,7 @@ describe("advanceTurnForWake", () => {
       expect.objectContaining({ ok: true, turn: expect.objectContaining({ status: "ended" }) }),
     ]);
     expect(mockPrisma.daemonSession.update).toHaveBeenCalledTimes(1);
-    expect(mockEventBus.emit).toHaveBeenCalledTimes(1);
+    expect(mockEventBus.emit).toHaveBeenCalledTimes(2);
     expect(persistedUsage).toEqual(usage);
   });
 
@@ -2651,9 +3087,10 @@ describe("advanceTurnForWake — coalescedCount settlement of superseded pending
       ([, payload]) => payload?.turn?.status === MERGED_TURN_STATUS,
     );
     expect(mergedEmits).toHaveLength(0);
-    // The running-transition itself still emits exactly once (its turn is "running").
-    expect(mockEventBus.emit).toHaveBeenCalledTimes(1);
+    // The running transition emits the existing transcript update plus one activity start.
+    expect(mockEventBus.emit).toHaveBeenCalledTimes(2);
     expect(mockEventBus.emit.mock.calls[0][1].turn.status).toBe("running");
+    expect(mockEventBus.emit.mock.calls[1][1].type).toBe("session_started");
   });
 
   it("settlement is bound to the RUNNING transition — a terminal edge (→ended) with coalescedCount>1 settles nothing", async () => {
@@ -2736,9 +3173,11 @@ describe("reconcileOrphanTurns", () => {
     expect(data.status).toBe("interrupted");
     expect(data.interruptedReason).toBe("offline");
     expect(data.endedAt).toBeInstanceOf(Date);
-    // SSE published by the chokepoint (not reimplemented here).
-    expect(mockEventBus.emit).toHaveBeenCalledTimes(1);
+    // Existing transcript SSE plus the session-ended activity are both owned by
+    // the chokepoint (not reimplemented here).
+    expect(mockEventBus.emit).toHaveBeenCalledTimes(2);
     expect(mockEventBus.emit.mock.calls[0][1].trigger).toBe("turn_status_changed");
+    expect(mockEventBus.emit.mock.calls[1][1].type).toBe("session_ended");
   });
 
   it("AGE-ONLY rule: a fresh lastSeenAt is NOT eligible even when status is 'offline' (abort→reconnect gap)", async () => {

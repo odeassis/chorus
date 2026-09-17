@@ -38,6 +38,12 @@ Idea ──> Proposal ──> [Document + Task DAG] ──> Execute ──> Veri
 
 ## 最近の更新
 
+**[v0.18.0](https://chorus-ai.dev/blog/chorus-v0.18.0-release/)** — OpenSpec を補う、軽量で Git ネイティブなローカル Spec 管理として `spec-lite` を内蔵しました。live session anchor により、デーモンエージェントからの返信が、起点となったエージェントの既存 Idea セッションへ戻ります。
+
+**[v0.17.2](https://chorus-ai.dev/blog/chorus-v0.17.2-release/)** — Pi が正式配布とデーモンウェイクに対応し、`chorus agents run` でローカルのエージェントプロファイルをすぐ切り替えられます。
+
+**[v0.17.0–0.17.1](https://github.com/Chorus-AIDLC/Chorus/releases/tag/v0.17.1)** — 1 つの CLI で各コーディングエージェントに Chorus を導入・更新できるようになりました。Tracker、Graph、Idea 詳細ではデーモンの活動をリアルタイムに確認できます。
+
 **[v0.16.4](https://chorus-ai.dev/blog/chorus-v0.16.4-release/)** — DeepSeek Harness（dsh）が 6 つ目の接続方法に。`@chorus-aidlc/chorus-dsh` バンドルが Chorus のスキル・ペルソナ・MCP 設定を任意の dsh プロファイルに追加します。現時点は対話的な利用のみ、デーモンウェイクは後日対応。
 
 **[v0.16.1](https://chorus-ai.dev/blog/chorus-v0.16.1-release/)** — 1 つの `chorus daemon` が、互いに独立した複数のエージェントを同時に扱えるようになりました。各エージェントは `agents[]` 配列で自分のキー・作業ディレクトリ・バックエンド・権限を持ちます。エージェント同士は @メンションで作業を渡し合え、各ウェイクはそのエージェント自身のプロジェクトディレクトリに届きます。
@@ -46,9 +52,7 @@ Idea ──> Proposal ──> [Document + Task DAG] ──> Execute ──> Veri
 
 **[v0.15.0](https://chorus-ai.dev/blog/chorus-v0.15.0-release/)** — プロジェクト単位の Agent 作業ディレクトリ：各ユーザーがプロジェクト内の Agent ごとにホストと cwd を設定し、デーモンが許可したルートだけを参照できます。割り当て、ウェイク、再開、後続ターンで同じ実行先を使い、進行中のセッションは移動しません。Codex は再開可能なバックエンド thread ID を別に保存し、不要になった Chorus の session 管理手順を削除しました。
 
-**[v0.14.1](https://chorus-ai.dev/blog/chorus-v0.14.1-release/)** — Amazon Kiro CLI が 4 つ目の接続方法になりました（Kiro CLI v2）：ワンコマンドの `install-kiro.sh` プラグインと `--agent kiro` デーモンバックエンド、加えていくつかのデーモン修正。
-
-**[v0.14.0](https://chorus-ai.dev/blog/chorus-v0.14.0-release/)** — アプリ全体のダークモード（ライト / ダーク / システム）。参考資料をあらゆる着想・提案・課題に添付でき、インラインでも MCP 経由でも読み取れます。韓国語と日本語を追加（韓国語はコミュニティによる貢献）。グループ化のための**テーマ**着想、デーモンの「開発を開始」/「Yolo」ボタン、対話式の着想入力、クラッシュからの再開、`chorus daemon install`。
+**[v0.14.1](https://chorus-ai.dev/blog/chorus-v0.14.1-release/)** — Amazon Kiro CLI が 4 つ目の接続方法になりました（Kiro CLI v2）：`chorus agents add` によるワンコマンドの Kiro プラグイン導入と `--agent kiro` デーモンバックエンド、加えていくつかのデーモン修正。
 
 > 完全な変更履歴：[CHANGELOG.md](CHANGELOG.md)
 
@@ -59,7 +63,7 @@ Idea ──> Proposal ──> [Document + Task DAG] ──> Execute ──> Veri
 2 つのコマンドだけです — データベースも Docker も設定ファイルも不要です。
 
 ```bash
-npm install -g @chorus-aidlc/chorus
+npm install -g @chorus-aidlc/chorus@0.18.1
 chorus
 ```
 

@@ -4,7 +4,7 @@ description: Chorus AI Agent collaboration platform — overview, common tools, 
 license: AGPL-3.0
 metadata:
   author: chorus
-  version: "0.16.4"
+  version: "0.18.1"
   category: project-management
   mcp_server: chorus
 ---
@@ -14,6 +14,12 @@ metadata:
 Chorus is a work collaboration platform for AI Agents, enabling multiple Agents (PM, Developer, Admin) and humans to collaborate on the same platform.
 
 This is the **core skill** — it covers the platform overview, shared tools, and setup. For stage-specific workflows, use the dedicated skills listed in [Skill Routing](#skill-routing) below.
+
+> **⚠️ Tool names under Pi — read this first.** Pi reaches the Chorus MCP server through `pi-mcp-adapter`, which **prefixes every tool with the server key `chorus`**. Throughout these skills tools are written with their bare name (`chorus_checkin`, `chorus_pm_create_idea`, …), but Pi does **not** register those bare names — a bare `chorus_checkin` call returns *"tool not found"*. Address each tool by its adapter name instead:
+> - **Namespaced form (preferred):** `mcp__chorus__<tool>` — e.g. `mcp__chorus__chorus_checkin`, `mcp__chorus__chorus_pm_create_idea`.
+> - **Flattened alias:** `chorus_<tool>` → the server prefix produces a **doubled** `chorus_chorus_*` (e.g. `chorus_chorus_pm_create_idea`). The double `chorus_` is expected, not a typo.
+>
+> So: wherever a skill names a tool `chorus_…`, call it as `mcp__chorus__chorus_…`. If a tool ever reads as *"not found"*, you almost certainly dropped the `mcp__chorus__` prefix. This is Pi-specific — other harnesses resolve the bare names directly.
 
 ---
 
@@ -151,7 +157,7 @@ Projects can be organized into **Project Groups** — a single-level grouping th
 
 ### Reports
 
-A **report** is a short idea-completion summary persisted as a `type="report"` Document at end-of-Idea, authored via `chorus_create_report` (gated on `document:write`). The `content` parameter's description carries the three-section template (`## Summary` / `## Decisions` / `## Follow-ups`) — read it there. `/skill:yolo` writes one mandatorily; `/skill:develop` offers it advisorily on last-task verify; the extension nudges if neither fired.
+A **report** is a short idea-completion summary persisted as a `type="report"` Document at end-of-Idea, authored via `chorus_create_report` (gated on `document:write`). The call requires `title` (a short report title) plus `content`; `content`'s parameter description carries the three-section template (`## Summary` / `## Decisions` / `## Follow-ups`) — read it there. `/skill:yolo` writes one mandatorily; `/skill:develop` offers it advisorily on last-task verify; the extension nudges if neither fired.
 
 ### References
 
@@ -352,20 +358,22 @@ export CHORUS_MAX_CODE_REVIEW_ROUNDS=5   # 0 = unlimited
 
 When enabled, reviewers run as read-only sub-agents and post a VERDICT comment on the proposal/task/idea. Three possible outcomes: **PASS** (no issues), **PASS WITH NOTES** (minor non-blocking notes), or **FAIL** (BLOCKERs found). Results are advisory — they do not block approval, verification, or ship; the code-review gateway in particular is behavioral (it does not change the Idea's stored status). On a code-review FAIL, fix it via the `/skill:quick-dev` workflow: `chorus_create_tasks` with `proposalUuid` set to the current approved proposal so the fix tasks attach to it. Group related small BLOCKERs into one cohesive task by default; split only materially large or independently testable fixes. Each fix task must self-check its acceptance criteria and pass independent task review plus admin verification. Re-run the gateway only after every fix task is successfully `done`; if there is a failed or cancelled fix task, stop and escalate instead. Disabling reduces token usage but removes the independent quality gate.
 
-### 6. Enable OpenSpec Mode (Optional)
+### 6. Spec mode: OpenSpec (default when usable) vs spec-lite (fallback)
 
-Opt-in spec-driven path: `/skill:proposal`, `/skill:develop`, and `/skill:yolo` write `proposal.md` / `design.md` / spec deltas on disk and mirror them into Chorus drafts. Fully optional — free-form authoring works without it. Activates only when all three hold: `CHORUS_OPENSPEC_MODE` ≠ `off`, an `openspec/` directory exists at the project root, and the `openspec` CLI is on `PATH`. The extension detects this at `session_start` and reports it in the injected context.
+The extension's `session_start` handler resolves one **spec mode** per session (via the TS `resolveSpecMode`, the single source of truth) and injects a `## Spec Mode` section stating it — the stage skills **consume** that value, they don't re-derive it. Resolution: an explicit `CHORUS_SPEC_MODE` (`lite`/`openspec`/`off`) wins; when unset, **OpenSpec is the default whenever it is usable** (`CHORUS_OPENSPEC_MODE` ≠ `off`, an `openspec/` directory at the project root, and the `openspec` CLI on `PATH`). When OpenSpec is absent or disabled, the mode falls back to **spec-lite** — a Chorus-native, git-tracked model with a durable local `.chorus/specs/<slug>/spec.md` per capability (never synced) plus dated per-change folders `<slug>/<YYYY-MM-DD>-<change-slug>/` of Chorus-typed docs mirrored 1:1 into Chorus (see `/skill:spec-lite`). `CHORUS_SPEC_MODE=off` selects free-form (no spec artifact).
 
-**When the user wants it on** (e.g. they ran `/skill:chorus enable openspec` after the `(OpenSpec off — …)` banner), actually **enable it for them** — run whichever steps are missing, don't just describe them:
+OpenSpec spec-driven path: `/skill:proposal`, `/skill:develop`, and `/skill:yolo` write `proposal.md` / `design.md` / spec deltas on disk and mirror them into Chorus drafts.
+
+**When the user wants OpenSpec on** (e.g. they saw `(spec: spec-lite)` / `(spec: off …)` in the banner), actually **enable it for them** — run whichever steps are missing, don't just describe them:
 
 ```bash
 npm i -g @fission-ai/openspec       # 1. install the CLI if it's not on PATH (global, pure Node)
 openspec init                        # 2. scaffold openspec/ (interactive; pick your editor tooling)
 ```
 
-The OpenSpec signal is read **once at session start**, so it can't flip mid-session — after the steps succeed, tell the user to **restart the session**; the banner then reads `(OpenSpec Enabled)` and the stage skills fold in the `openspec-aware` skill automatically.
+The spec mode is resolved **once at session start**, so it can't flip mid-session — after the steps succeed, tell the user to **restart the session**; the `## Spec Mode` section then reads `CHORUS_SPEC_MODE=openspec (…)` and the stage skills fold in the `openspec-aware` skill automatically.
 
-To turn it off, set `CHORUS_OPENSPEC_MODE=off` — the banner then reads a neutral `(OpenSpec off)`.
+To turn OpenSpec off, set `CHORUS_OPENSPEC_MODE=off` — the mode then falls back to **spec-lite** (or set `CHORUS_SPEC_MODE=off` for free-form). The `## Spec Mode` section always states the resolved mode + reason.
 
 ---
 
@@ -428,7 +436,8 @@ This is the core overview skill. For stage-specific workflows, use:
 | **Development** | `/skill:develop` | Claim Tasks, report work, session & parallel sub-agent integration |
 | **Review** | `/skill:review` | Approve/reject Proposals, verify Tasks, project governance |
 | **Docs** | `/skill:docs` | Consult the live Chorus documentation site to answer product-usage questions — UI workflow, agent/plugin setup, API/MCP, deployment, operations |
-| **OpenSpec mode** | `openspec-aware` | Opt-in **shared sub-procedure** invoked by `/skill:proposal`, `/skill:develop`, and `/skill:yolo` whenever the user has the `openspec` CLI installed. Scaffolds `openspec/changes/<slug>/` on disk and mirrors files into Chorus document drafts. Skips silently in fallback mode. See `skills/openspec-aware/SKILL.md`. |
+| **OpenSpec mode** | `openspec-aware` | **Shared sub-procedure** invoked by `/skill:proposal`, `/skill:develop`, and `/skill:yolo` when the resolved spec mode is a usable OpenSpec (the default when `openspec/` + CLI present and not disabled). Scaffolds `openspec/changes/<slug>/` on disk and mirrors files into Chorus document drafts via `chorus mcp call --arg-file` (`chorus-mcp-call.sh` wrapper as fallback). See `skills/openspec-aware/SKILL.md`. |
+| **spec-lite mode** | `spec-lite` | **Shared sub-procedure** and the fallback when OpenSpec isn't usable (or `CHORUS_SPEC_MODE=lite`). Durable local `.chorus/specs/<slug>/spec.md` (never synced) + dated per-change folders of Chorus-typed docs mirrored 1:1 into Chorus via `--arg-file`. No CLI/validation. See `skills/spec-lite/SKILL.md`. |
 
 ### Getting Started
 

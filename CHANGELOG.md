@@ -1,5 +1,123 @@
 # Changelog
 
+## [0.18.1] - 2026-09-17
+
+### Security
+- **JWT secrets**: Removed public default signing keys; Docker now generates and persists a secure secret. (#561)
+- **Upgrade note**: Replacing placeholder secrets requires Default Auth users and the Super Admin to sign in again. Update Compose to persist `/app/data`, or configure `NEXTAUTH_SECRET`; replicas must share the same secret. See [Docker migration guidance](https://github.com/Chorus-AIDLC/Chorus/blob/v0.18.1/docs/DOCKER.md).
+
+### Added
+- **CloudFront deployment**: Added an optional private-ALB deployment mode with custom-domain support. (#566)
+- **Comment actions**: Added responsive reply and owner-only delete actions. (#565)
+
+### Changed
+- **Daemon chat**: Improved mobile layout and simplified status details. (#563, #564, #567)
+
+### Fixed
+- **Proposal drafts**: Prevented concurrent edits from overwriting each other. (#556)
+- **Daemon sessions**: Fixed navigation to paginated sessions and turns stuck in the running state. (#568, #569)
+
+### Plugin
+- **Claude Code sessions**: Fixed subagent names and premature closure of shared sessions. (#562)
+- **Versions**: Upgraded all six plugins and four npm packages to `0.18.1`.
+
+---
+
+## [0.18.0] - 2026-09-11
+
+### Added
+- **Spec-lite local specifications**: Added a lightweight, Git-tracked specification workflow that complements OpenSpec across all six plugin surfaces. (#546)
+- **Waker session anchors**: Added live Idea-session context to agent-originated Idea and Task wakes so daemon agents can return replies to the initiating session. (#544)
+- **First-principles review alignment**: Proposal, task, and aggregate code reviewers now check delivered work against human-authored intent from the originating Idea. (#545)
+- **Per-agent launch configuration**: Added shared `args` and `env` configuration for daemon wakes and `chorus agents run`. (#553)
+- **Markdown frontmatter cards**: Added structured rendering for leading flat metadata across Markdown surfaces. (#547)
+
+### Changed
+- **Tracker Idea actions**: Consolidated Idea operations into an Actions menu with a mobile bottom sheet, copy utilities, disabled-state explanations, and preserved workflow gates. (#557, #558)
+
+### Fixed
+- **Reviewer harness fidelity**: Aligned reviewer waiting, parallel dispatch, and spec-lite templates with actual harness behavior; a missing verdict is no longer treated as approval. (#548)
+- **Proposal reviewer inspection**: Added read-only shell inspection across all seven skill surfaces so proposal reviewers can verify referenced paths before reporting blockers. (#554)
+- **CLI test isolation and Pi specifications**: Isolated CLI tests from developers' real Chorus state and corrected specifications that described Pi as non-wakeable. (#551, #552)
+
+### Plugin
+- **Plugin and package versions → 0.18.0**: Aligned Claude Code, Codex, OpenClaw, Kiro, Pi, dsh, and all four coordinated npm packages.
+
+---
+
+## [0.17.3] - 2026-09-07
+
+### Added
+- **Pi async subagents**: Added session lifecycle support for detached subagent runs, duplicate-injection protection, and compatibility guidance for nicobailon `pi-subagents`.
+
+### Changed
+- **dsh daemon backend**: Upgraded to dsh 0.1.2-rc.1 and its `dsh --profile sdk` launch model.
+- **Daemon conversations**: Added server-side session pagination, reducing chat modal startup and polling payloads.
+
+### Fixed
+- **npm provenance verification**: Extended propagation retries while preserving fail-fast behavior for authorization and service errors.
+
+### Plugin
+- **Plugin and package versions → 0.17.3**: Aligned Claude Code, Codex, OpenClaw, Kiro, Pi, dsh, and all four coordinated npm packages.
+
+---
+
+## [0.17.2] - 2026-09-04
+
+### Added
+- **Configured agent launcher**: Added `chorus agents run` to launch configured coding agents interactively with scoped Chorus credentials and verbatim argument forwarding. (#537)
+- **Production-ready Pi integration**: Added the publishable `@chorus-aidlc/chorus-pi` package, native subagents, daemon wake support, automated installation, and coordinated npm publishing. (#532)
+- **Automated Docker publishing**: Added branch and release workflows for multi-architecture Docker images with safe tag handling. (#534)
+
+### Changed
+- **Shared dashboard event stream**: Consolidated dashboard SSE consumers onto one stable connection per browser tab while preserving filtering and reconnect recovery. (#530)
+
+### Fixed
+- **Touch-friendly active sessions**: Improved active-session navigation and selection for touch, pen, keyboard, and pointer input. (#531)
+- **Stable daemon activity markers**: Removed the reconnect race that could hide active-session markers in the Idea Tracker. (#536)
+- **Native multi-architecture builds**: Replaced slow QEMU-based ARM builds with native per-architecture runners and digest merging. (#535)
+
+### Plugin
+- **Plugin and skill versions → 0.17.2**: Aligned Claude Code, Codex, OpenClaw, Kiro, Pi, and dsh distributions and all four coordinated npm packages to version 0.17.2.
+
+---
+
+## [0.17.1] - 2026-09-01
+
+### Added
+- **Installed agent plugin refresh**: Added one-time update confirmation and native refresh flows for Claude Code, Codex, OpenCode, dsh, OpenClaw, and Kiro. (#516)
+- **Live daemon activity on Ideas**: Added real-time daemon activity indicators across Tracker, Graph, and Idea detail views, including mobile session drilldown. (#517)
+- **Automated coordinated npm releases**: Added tokenless GitHub Actions publishing for the Chorus CLI, OpenClaw plugin, and dsh plugin with reproducible validation, provenance checks, and safe reruns. (#522)
+
+### Fixed
+- **Non-ASCII working-directory resume**: Daemon-backed agent sessions now resume correctly when their working directory contains non-ASCII characters. (#518)
+- **Daemon chat initial loading**: Bounded and coalesced initial chat loading work to avoid excessive requests and processing. (#519)
+- **Idea assignment targeting**: Project-fixed working-directory targets now take precedence correctly, while reassignment wakes are deduplicated for an unchanged owner; skill documentation now reflects these semantics. (#520, #525)
+- **Mobile project creation**: Restored the New Project entry on the mobile project-group bar. (#523)
+- **Live-session indicator flicker**: Prevented the active-session popover from reopening when the pointer leaves its trigger. (#524)
+
+---
+
+## [0.17.0] - 2026-08-28
+
+### Added
+- **Unified agent management CLI**: Added `chorus agents add/list/remove` for configuring Claude Code, Codex, Kiro, OpenCode, OpenClaw, Pi, and dsh, including plugin installation where supported, credential seeding, per-agent daemon wake controls, and Linux/macOS auto-start. (#503, #504, #506, #507)
+- **Native MCP client**: Added `chorus mcp call`, `whoami`, and `list` with multi-agent selection, file-backed arguments, and byte-compatible output for plugin and OpenSpec workflows. (#505)
+- **Export-free Claude Code and Codex setup**: `chorus agents add` now configures Claude Code through `~/.claude/settings.json` and Codex through `~/.codex/.env` plus keyless `bearer_token_env_var` MCP authentication. (#509, #510)
+
+### Changed
+- **Bootstrap and plugin workflows**: Retired per-agent installation scripts in favor of the unified CLI; plugin MCP wrappers now prefer `chorus mcp call`, with compatibility fallbacks when the CLI is unavailable. (#507)
+- **Agent check-in context**: Replaced the per-Idea check-in list with a bounded active-project distribution while preserving full assignments on demand and adding AI-DLC/search guidance at session start. (#512)
+
+### Fixed
+- **Codex sub-agent orchestration**: Updated worker and reviewer spawning to use the current object-based spawn API, explicit skill mounting, and correct lifecycle handling. (#511)
+- **Nested theme status**: Container Idea status now rolls up bottom-up across nested themes while preserving direct-child progress and deterministic cycle handling. (#513)
+
+### Plugin
+- **Plugin and skill versions → 0.17.0**: Claude Code, Codex, OpenClaw, Kiro, Pi, dsh, and standalone skill distributions now share version 0.17.0 and include the new `chorus-cli` skill. (#507)
+
+---
+
 ## [0.16.4] - 2026-08-19
 
 ### Added
