@@ -4,7 +4,7 @@ description: Chorus AI Agent collaboration platform — overview, common tools, 
 license: AGPL-3.0
 metadata:
   author: chorus
-  version: "0.18.1"
+  version: "0.19.1"
   category: project-management
   mcp_server: chorus
 ---
@@ -112,7 +112,7 @@ Results can be filtered by project(s) using optional HTTP headers in your `.mcp.
 
 ### Session (Sub-Agents Only)
 
-The Chorus Pi extension **fully automates** session lifecycle. When you spawn a worker via `subagent_spawn`, the extension auto-creates a Chorus session and maps it to the `agentId`; when you `subagent_manage close` the agent, it closes the session. Sub-agents only need to:
+The Chorus Pi extension **fully automates** session lifecycle. When you dispatch a worker with the `subagent` tool, the extension auto-creates a Chorus session and injects its UUID + workflow into that worker's task; it closes the session when the dispatch returns (bundled subagent) or when the run settles (`subagent:async-complete` / `process-terminal` under nicobailon `pi-subagents`). Sub-agents only need to:
 
 1. `chorus_session_checkin_task` — before starting work on a task
 2. `chorus_session_checkout_task` — when done with a task
@@ -164,6 +164,20 @@ A **report** is a short idea-completion summary persisted as a `type="report"` D
 A **reference** is a first-class external-evidence link (`docs` / `repo` / `issue_pr` / `paper_blog`) attached to an idea / proposal / task via `chorus_add_reference`, or inline at creation via the `references[]` param on `chorus_pm_create_idea` / `chorus_pm_create_proposal` / `chorus_create_tasks`. References read back inline through the `chorus_get_*` tools.
 
 **Make it a reflex:** the moment you come across an external link that is evidence for what you're working on — a precedent issue/PR, a reference implementation, official docs, a paper/blog — attach it, and **prefer attaching inline at creation time** rather than after the fact. See `/skill:idea` (Step 4.4) for the type-selection criteria and a worked example.
+
+#### Cite evidence in Markdown
+
+Use the **reference record's UUID** to link evidence directly from any Idea, Proposal, Task, Document body or comment:
+
+```markdown
+This conclusion is supported by [1](ref:550e8400-e29b-41d4-a716-446655440000).
+```
+
+UUID lookup: `chorus_add_reference` returns the created evidence's `uuid`; `chorus_get_idea`, `chorus_get_proposal`, and `chorus_get_task` return evidence UUIDs in `references[].uuid`. An entity's top-level `uuid` identifies the entity, not its evidence. Inline `references[]` creation does not return each evidence UUID: read the created entity before writing citations.
+
+Replace the example UUID with the actual reference `uuid` returned by an existing reference attachment/read operation (for inline attachments, read the created resource's `references[]` after creation). Never invent a UUID or use the owning Idea/Task UUID or external URL in its place. Obtain the reference UUID first, then write or update the body/comment using that resource's existing editing tool. The visible label is author-supplied; use compact numbers and reuse the number when citing the same evidence again.
+
+Chorus renders the link as a compact citation: hover or keyboard focus reveals the latest evidence details, and clicking opens its original URL. Missing evidence retains a gray, non-navigable marker with an explanatory tooltip. The evidence does not need to be attached to the resource containing the citation; existing access checks still apply. Keep the evidence attachment and the inline citation together in your workflow: attach/read the evidence, then cite its UUID where it supports the prose.
 
 ### Proposals
 
@@ -339,7 +353,7 @@ The table below shows default tool availability for each preset (no custom permi
 
 ### 5. Review Agent Configuration
 
-The extension includes three independent review agents. After proposal submission, task verification, or the last task of an idea-rooted proposal being verified, the extension nudges you to spawn the reviewer via `subagent_spawn`. You must spawn it manually — it is NOT auto-launched. All are **enabled by default**.
+The extension includes three independent review agents. After proposal submission, task verification, or the last task of an idea-rooted proposal being verified, the extension nudges you to dispatch the reviewer with the `subagent` tool. You must spawn it manually — it is NOT auto-launched. All are **enabled by default**.
 
 | Setting | Controls | Default |
 |---------|----------|---------|
@@ -380,7 +394,7 @@ To turn OpenSpec off, set `CHORUS_OPENSPEC_MODE=off` — the mode then falls bac
 ## Execution Rules
 
 1. **Always check in first** — Call `chorus_checkin()` at session start (the extension does this automatically and injects the result)
-2. **Sessions are automatic** — The extension creates, heartbeats, and closes sessions on `subagent_spawn` / `subagent_manage close`. Never call `chorus_create_session` or `chorus_close_session` yourself.
+2. **Sessions are automatic** — The extension creates the session when you dispatch a worker with the `subagent` tool, and closes it when the dispatch returns (bundled subagent) or when the run settles (nicobailon `pi-subagents`). Never call `chorus_create_session` or `chorus_close_session` yourself.
 3. **Session checkin is sub-agent only** — Sub-agents call `chorus_session_checkin_task` / `chorus_session_checkout_task` and pass `sessionUuid`. Main agent skips session tools entirely.
 4. **Stay in your role** — Only use tools available to your role
 5. **Report progress** — Use `chorus_report_work` or `chorus_add_comment`
@@ -390,7 +404,7 @@ To turn OpenSpec off, set `CHORUS_OPENSPEC_MODE=off` — the mode then falls bac
 9. **Document decisions** — Add comments explaining your reasoning
 10. **Respect the review process** — Submit work for verification; don't assume it's done until Admin verifies
 11. **Always use AskUserQuestion for human interaction** — NEVER display questions as plain text; use interactive radio buttons (the `ask_user_question` tool)
-12. **Close sub-agents after use** — Pi limits concurrent sub-agents; after a reviewer/worker finishes, call `subagent_manage close` to release the slot. `completed` does not release it.
+12. **No close step** — a `subagent` dispatch owns its children's whole lifecycle: the bundled subagent's children exit within the call, and a nicobailon run settles on its own, so there is nothing to close (inspect a run with `subagent({ action: "status" })` if needed).
 
 ---
 
@@ -432,6 +446,7 @@ This is the core overview skill. For stage-specific workflows, use:
 | **Orchestration** | `/skill:orchestrate` | Coordinate OTHER agents & humans across the lifecycle — delegate ideas (`chorus_pm_assign_idea`) & tasks, fan a theme out to child ideas, run independent reviewers, and gatekeep the proposal/verify gates |
 | **Quick Dev** | `/skill:quick-dev` | Skip Idea→Proposal, create tasks directly, execute, and verify |
 | **Ideation** | `/skill:idea` | Claim Ideas, run elaboration rounds, prepare for proposal |
+| **Research** | `/skill:research` | Optional bounded factual checks shared by Idea and Proposal; explicit Tracker Research saves findings to the Idea and returns without advancing lifecycle |
 | **Planning** | `/skill:proposal` | Create Proposals with document & task drafts, manage dependency DAG, submit for review |
 | **Development** | `/skill:develop` | Claim Tasks, report work, session & parallel sub-agent integration |
 | **Review** | `/skill:review` | Approve/reject Proposals, verify Tasks, project governance |
